@@ -1,0 +1,998 @@
+import os
+import queue
+import random
+import threading
+import time
+import tkinter as tk
+from collections import deque
+from dataclasses import dataclass
+from datetime import datetime
+from tkinter import ttk
+
+import matplotlib.pyplot as plt
+import networkx as nx
+import numpy as np
+import requests
+import torch
+import torch.nn as nn
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.patches import FancyArrowPatch
+
+plt.style.use("dark_background")
+
+# ================= CONFIG =================
+HISTORY = 120
+MAX_VOL = 900
+UPDATE_MS = 1000
+BLOCK_DURATION = 30
+PRED_HORIZON = 12
+CITY_NAME = "SimCity Grid"
+
+
+@dataclass
+class DemandConfig:
+    morning_peak: tuple[int, int] = (7, 10)
+    evening_peak: tuple[int, int] = (16, 20)
+    weekend_drop: float = 0.82
+    rain_prob: float = 0.14
+    event_prob: float = 0.03
+
+
+@dataclass
+class SensorHealth:
+    quality: float = 1.0
+    dropouts: int = 0
+    degraded: bool = False
+
+
+class VoiceAlert:
+    def __init__(self):
+        self.enabled = True
+        self._engine = None
+        self._last_spoken = 0.0
+        self.cooldown_s = 4.0
+        try:
+            import pyttsx3
+
+            self._engine = pyttsx3.init()
+            self._engine.setProperty("rate", 170)
+            self._engine.setProperty("volume", 0.9)
+        except Exception:
+            self.enabled = False
+
+    def speak(self, text: str):
+        if not self.enabled:
+            return
+        if time.time() - self._last_spoken < self.cooldown_s:
+            return
+        self._last_spoken = time.time()
+        try:
+            self._engine.say(text)
+            self._engine.runAndWait()
+        except Exception:
+            self.enabled = False
+
+
+class TrafficLSTM(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.lstm = nn.LSTM(1, 32, batch_first=True)
+        self.fc = nn.Linear(32, 1)
+
+    def forward(self, x):
+        o, _ = self.lstm(x)
+        return self.fc(o[:, -1])
+
+
+class NeuralPredictor:
+    def __init__(self, seq: int = 20):
+        self.seq = seq
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = TrafficLSTM().to(self.device)
+        self.opt = torch.optim.Adam(self.model.parameters(), lr=1e-3)
+        self.loss_fn = nn.MSELoss()
+        self.buffers: dict[str, list[float]] = {}
+
+    def update(self, node: str, value: float):
+        buf = self.buffers.setdefault(node, [])
+        buf.append(float(value))
+        if len(buf) < self.seq + 1:
+            return
+        x = torch.tensor(buf[-self.seq - 1 : -1], dtype=torch.float32).view(1, -1, 1).to(self.device)
+        y = torch.tensor([buf[-1]], dtype=torch.float32).to(self.device)
+        pred = self.model(x).squeeze()
+        loss = self.loss_fn(pred, y)
+        self.opt.zero_grad()
+        loss.backward()
+        self.opt.step()
+
+        if len(buf) > self.seq * 4:
+            self.buffers[node] = buf[-(self.seq + 1) :]
+
+    def predict(self, node: str, steps: int = PRED_HORIZON):
+        buf = self.buffers.get(node, [])
+        if len(buf) < self.seq:
+            return None, None, [], 0.0
+
+        x = torch.tensor(buf[-self.seq :], dtype=torch.float32).view(1, -1, 1).to(self.device)
+        preds = []
+        with torch.no_grad():
+            for _ in range(steps):
+                p = self.model(x).item()
+                preds.append(p)
+                x = torch.cat([x[:, 1:], torch.tensor([[[p]]], device=self.device)], dim=1)
+
+        conf = max(0.05, 1.0 - min(1.0, float(np.std(preds) / 250.0)))
+        return float(np.mean(preds)), float(np.std(preds) + 1e-3), preds, conf
+
+
+class LiveTrafficIntegrator:
+    """Live data from TomTom/X/HERE/Google with resilient fallbacks."""
+
+    def __init__(self):
+        self.tomtom_key = os.getenv("TOMTOM_API_KEY")
+        self.here_key = os.getenv("HERE_API_KEY")
+        self.google_key = os.getenv("GOOGLE_MAPS_API_KEY")
+        self.x_bearer = os.getenv("X_BEARER_TOKEN")
+
+        self.last_poll = 0.0
+        self.next_poll_s = 35
+        self.last_success = 0.0
+        self.live_mode = False
+        self.last_error = ""
+
+        self.speed_factor = 1.0
+        self.incident_points: list[tuple[float, float]] = []
+        self.social_incidents: list[str] = []
+        self.google_eta_s = None
+        self.provider_status = {"TomTom": "idle", "HERE": "idle", "X": "idle", "Google": "idle"}
+        self.last_latency_ms = 0
+
+    def should_poll(self):
+        return time.time() - self.last_poll >= self.next_poll_s
+
+    def poll_all(self, origin_xy: tuple[float, float] | None, dest_xy: tuple[float, float] | None):
+        self.last_poll = time.time()
+        self.next_poll_s = random.randint(30, 60)
+        started = time.time()
+        self.last_error = ""
+
+        success = False
+
+        try:
+            self.speed_factor = self.fetch_tomtom_speed_factor()
+            self.provider_status["TomTom"] = "ok"
+            success = True
+        except Exception as exc:
+            self.provider_status["TomTom"] = "degraded"
+            self.last_error = f"TomTom: {exc}"
+            self.speed_factor = 1.0
+
+        try:
+            self.incident_points = self.fetch_here_incidents(origin_xy)
+            self.provider_status["HERE"] = "ok"
+            success = True
+        except Exception as exc:
+            self.provider_status["HERE"] = "degraded"
+            self.last_error = f"{self.last_error} | HERE: {exc}".strip(" |")
+            self.incident_points = []
+
+        try:
+            self.social_incidents = self.fetch_x_incidents()
+            self.provider_status["X"] = "ok" if self.social_incidents is not None else "degraded"
+            success = True
+        except Exception as exc:
+            self.provider_status["X"] = "degraded"
+            self.last_error = f"{self.last_error} | X: {exc}".strip(" |")
+            self.social_incidents = []
+
+        try:
+            self.google_eta_s = self.fetch_google_eta(origin_xy, dest_xy)
+            self.provider_status["Google"] = "ok"
+            success = True
+        except Exception as exc:
+            self.provider_status["Google"] = "degraded"
+            self.last_error = f"{self.last_error} | Google: {exc}".strip(" |")
+            self.google_eta_s = None
+
+        self.live_mode = success
+        if success:
+            self.last_success = time.time()
+        self.last_latency_ms = int((time.time() - started) * 1000)
+
+    def fetch_tomtom_speed_factor(self) -> float:
+        if not self.tomtom_key:
+            raise RuntimeError("TOMTOM_API_KEY missing")
+        lat, lon = 12.9716, 77.5946
+        url = f"https://api.tomtom.com/traffic/services/4/flowSegmentData/absolute/10/json?point={lat},{lon}&key={self.tomtom_key}"
+        resp = requests.get(url, timeout=8)
+        resp.raise_for_status()
+        data = resp.json().get("flowSegmentData", {})
+        current = float(data.get("currentSpeed", 0) or 0)
+        freeflow = max(1.0, float(data.get("freeFlowSpeed", 1) or 1))
+        if current <= 0:
+            raise RuntimeError("TomTom missing currentSpeed")
+        jam_factor = np.clip(1.0 - (current / freeflow), 0.0, 1.0)
+        return float(np.clip(1.0 - jam_factor * 0.65, 0.2, 1.0))
+
+    def fetch_here_incidents(self, origin_xy: tuple[float, float] | None):
+        if not self.here_key or not origin_xy:
+            return []
+        lon, lat = origin_xy
+        bbox = f"{lat-0.08},{lon-0.08},{lat+0.08},{lon+0.08}"
+        url = f"https://data.traffic.hereapi.com/v7/incidents?in=bbox:{bbox}&apiKey={self.here_key}"
+        resp = requests.get(url, timeout=8)
+        resp.raise_for_status()
+        data = resp.json()
+        points = []
+        for item in data.get("results", [])[:20]:
+            loc = item.get("location", {})
+            lat_ = loc.get("lat")
+            lon_ = loc.get("lng")
+            if lat_ is not None and lon_ is not None:
+                points.append((lat_, lon_))
+        return points
+
+    def fetch_x_incidents(self):
+        if not self.x_bearer:
+            return []
+        query = '("traffic jam Bengaluru" OR "accident Bengaluru highway") filter:news since:2025-02-01'
+        url = "https://api.x.com/2/tweets/search/recent"
+        headers = {"Authorization": f"Bearer {self.x_bearer}"}
+        params = {"query": query, "max_results": 10}
+        resp = requests.get(url, headers=headers, params=params, timeout=8)
+        resp.raise_for_status()
+        data = resp.json()
+        return [d.get("text", "") for d in data.get("data", [])]
+
+    def fetch_google_eta(self, origin_xy: tuple[float, float] | None, dest_xy: tuple[float, float] | None):
+        if not self.google_key or not origin_xy or not dest_xy:
+            return None
+        origin = f"{origin_xy[1]},{origin_xy[0]}"
+        dest = f"{dest_xy[1]},{dest_xy[0]}"
+        url = "https://maps.googleapis.com/maps/api/directions/json"
+        params = {"origin": origin, "destination": dest, "departure_time": "now", "key": self.google_key}
+        resp = requests.get(url, params=params, timeout=8)
+        resp.raise_for_status()
+        data = resp.json()
+        routes = data.get("routes", [])
+        if not routes:
+            return None
+        legs = routes[0].get("legs", [])
+        if not legs:
+            return None
+        return legs[0].get("duration_in_traffic", {}).get("value") or legs[0].get("duration", {}).get("value")
+
+    def live_badge(self):
+        if self.live_mode:
+            age = int(time.time() - self.last_success)
+            return f"Live: TomTom • Updated {age}s ago"
+        return "Live: Simulation only"
+
+    def provider_badge(self):
+        parts = [f"{k}:{'OK' if v == 'ok' else 'WARN'}" for k, v in self.provider_status.items()]
+        return " | ".join(parts) + f" | Latency:{self.last_latency_ms}ms"
+
+
+class TrafficSim:
+    def __init__(self, nodes):
+        self.cfg = DemandConfig()
+        self.nodes = nodes
+        self.phase = np.random.rand(len(nodes)) * 10
+        self.hist = {n: deque([200.0] * HISTORY, maxlen=HISTORY) for n in self.nodes}
+        self.hist_sim = {n: deque([200.0] * HISTORY, maxlen=HISTORY) for n in self.nodes}
+        self.hist_real = {n: deque([200.0] * HISTORY, maxlen=HISTORY) for n in self.nodes}
+        self.ema = {n: 200.0 for n in self.nodes}
+        self.health = {n: SensorHealth() for n in self.nodes}
+        self.last_context = "Clear"
+
+    def calibrate_from_historical(self, traffic_integrator: LiveTrafficIntegrator):
+        # Placeholder calibration using live capability status (fallback-safe).
+        if traffic_integrator.tomtom_key:
+            self.cfg.morning_peak = (7, 11)
+            self.cfg.evening_peak = (16, 21)
+            self.cfg.weekend_drop = 0.78
+
+    def _hour_multiplier(self, now: datetime) -> float:
+        h = now.hour + now.minute / 60.0
+        m = 1.0
+        if self.cfg.morning_peak[0] <= h <= self.cfg.morning_peak[1]:
+            m *= 1.35
+        if self.cfg.evening_peak[0] <= h <= self.cfg.evening_peak[1]:
+            m *= 1.45
+        if now.weekday() >= 5:
+            m *= self.cfg.weekend_drop
+        return m
+
+    def _context(self):
+        weather_factor = 1.0
+        event_factor = 1.0
+        cause = "Clear"
+        if random.random() < self.cfg.rain_prob:
+            weather_factor *= random.uniform(0.86, 0.95)
+            cause = "Rain impact"
+        if random.random() < self.cfg.event_prob:
+            event_factor *= random.uniform(1.08, 1.30)
+            cause = "City event surge"
+        return weather_factor, event_factor, cause
+
+    def step(self, speed_factor: float = 1.0):
+        now = datetime.now()
+        t = time.monotonic()
+        demand_mult = self._hour_multiplier(now)
+        weather_factor, event_factor, cause = self._context()
+        self.last_context = cause
+
+        out = {}
+        sim_only = {}
+        for i, n in enumerate(self.nodes):
+            base = 220 + 40 * np.sin(t / 60)
+            wave = 120 * np.sin(t / 10 + self.phase[i])
+            noise = np.random.normal(0, 15)
+            simulated_vol = np.clip((base + wave + noise) * demand_mult * weather_factor * event_factor, 30, 890)
+
+            # requested blending (interpreted with live scaling)
+            live_scaled = simulated_vol * speed_factor
+            real_vol = speed_factor * live_scaled + (1 - speed_factor) * simulated_vol
+
+            health = self.health[n]
+            if random.random() < 0.015:
+                real_vol = self.ema[n]
+                health.dropouts += 1
+                health.quality = max(0.2, health.quality - 0.08)
+            else:
+                health.quality = min(1.0, health.quality + 0.01)
+            health.degraded = health.quality < 0.55
+
+            self.ema[n] = 0.2 * real_vol + 0.8 * self.ema[n]
+            v = float(self.ema[n])
+            self.hist[n].append(v)
+            self.hist_sim[n].append(float(simulated_vol))
+            self.hist_real[n].append(float(real_vol))
+            out[n] = v
+            sim_only[n] = float(simulated_vol)
+        return out, sim_only
+
+
+class Router:
+    """Realistic simulated city network with arterial/collector/local roads."""
+
+    def __init__(self, city=CITY_NAME, grid_w=8, grid_h=6, spacing_km=0.7):
+        self.city = city
+        self.grid_w = grid_w
+        self.grid_h = grid_h
+        self.spacing_km = spacing_km
+        self.G = nx.Graph()
+        self.blocked_edges = {}
+        self._build_simulated_city()
+        self.nodes = list(self.G.nodes())
+
+    def _node_name(self, x, y):
+        return f"N{x}_{y}"
+
+    def _add_road(self, u, v, length_km, road_type):
+        spec = {
+            "arterial": {"speed": 55, "lanes": 3},
+            "collector": {"speed": 42, "lanes": 2},
+            "local": {"speed": 30, "lanes": 1},
+            "ring": {"speed": 48, "lanes": 2},
+        }[road_type]
+        speed = spec["speed"]
+        lanes = spec["lanes"]
+        freeflow_s = max(8.0, (length_km / max(speed, 5)) * 3600.0)
+        capacity = max(220.0, lanes * speed * 12.0)
+        self.G.add_edge(
+            u,
+            v,
+            freeflow_s=freeflow_s,
+            capacity=capacity,
+            w=freeflow_s,
+            road_type=road_type,
+            length_km=length_km,
+            lanes=lanes,
+            speed_kmh=speed,
+        )
+
+    def _build_simulated_city(self):
+        base_lon, base_lat = 77.56, 12.93
+
+        # Create city grid intersections.
+        for y in range(self.grid_h):
+            for x in range(self.grid_w):
+                n = self._node_name(x, y)
+                self.G.add_node(
+                    n,
+                    x=base_lon + x * 0.01,
+                    y=base_lat + y * 0.01,
+                    zone=("CBD" if 2 <= x <= 5 and 2 <= y <= 4 else "URBAN"),
+                )
+
+        # Horizontal corridors: middle rows as arterials, edges as collectors.
+        for y in range(self.grid_h):
+            for x in range(self.grid_w - 1):
+                u, v = self._node_name(x, y), self._node_name(x + 1, y)
+                road_type = "arterial" if y in (2, 3) else "collector"
+                self._add_road(u, v, self.spacing_km, road_type)
+
+        # Vertical corridors: middle columns as arterials.
+        for x in range(self.grid_w):
+            for y in range(self.grid_h - 1):
+                u, v = self._node_name(x, y), self._node_name(x, y + 1)
+                road_type = "arterial" if x in (3, 4) else "collector"
+                self._add_road(u, v, self.spacing_km, road_type)
+
+        # Diagonal connector roads (flyovers/shortcuts).
+        for x in range(1, self.grid_w - 1, 2):
+            for y in range(1, self.grid_h - 1, 2):
+                a = self._node_name(x, y)
+                b = self._node_name(x + 1, y + 1)
+                self._add_road(a, b, self.spacing_km * 1.35, "local")
+
+        # Add inner and outer ring roads for realistic bypass behavior.
+        ring_inner = [self._node_name(x, 1) for x in range(1, self.grid_w - 1)] + [self._node_name(self.grid_w - 2, y) for y in range(2, self.grid_h - 1)] + [self._node_name(x, self.grid_h - 2) for x in range(self.grid_w - 3, 0, -1)] + [self._node_name(1, y) for y in range(self.grid_h - 3, 1, -1)]
+        for i in range(len(ring_inner)):
+            self._add_road(ring_inner[i], ring_inner[(i + 1) % len(ring_inner)], self.spacing_km, "ring")
+
+        # Peripheral bypass links.
+        for x in range(self.grid_w - 1):
+            self._add_road(self._node_name(x, 0), self._node_name(x + 1, 0), self.spacing_km * 1.15, "ring")
+            self._add_road(self._node_name(x, self.grid_h - 1), self._node_name(x + 1, self.grid_h - 1), self.spacing_km * 1.15, "ring")
+
+        for y in range(self.grid_h - 1):
+            self._add_road(self._node_name(0, y), self._node_name(0, y + 1), self.spacing_km * 1.15, "ring")
+            self._add_road(self._node_name(self.grid_w - 1, y), self._node_name(self.grid_w - 1, y + 1), self.spacing_km * 1.15, "ring")
+
+    def block_edge(self, u, v, duration=30):
+        self.blocked_edges[tuple(sorted((u, v)))] = time.time() + duration
+
+    def block_incident_near(self, lat: float, lon: float, duration=45):
+        nearest = None
+        nearest_d = 1e9
+        for u, v in self.G.edges():
+            ux, uy = self.G.nodes[u]["x"], self.G.nodes[u]["y"]
+            vx, vy = self.G.nodes[v]["x"], self.G.nodes[v]["y"]
+            cx, cy = (ux + vx) / 2.0, (uy + vy) / 2.0
+            d = (cx - lon) ** 2 + (cy - lat) ** 2
+            if d < nearest_d:
+                nearest_d = d
+                nearest = (u, v)
+        if nearest:
+            self.block_edge(nearest[0], nearest[1], duration)
+            return nearest
+        return None
+
+    def check_blocks(self):
+        now = time.time()
+        expired = [k for k, expiry in self.blocked_edges.items() if expiry < now]
+        for k in expired:
+            del self.blocked_edges[k]
+        return self.blocked_edges
+
+    def update(self, vols, signal_boost=0.0):
+        alpha, beta = 0.2, 3.2
+        for u, v in self.G.edges():
+            key = tuple(sorted((u, v)))
+            edge = self.G[u][v]
+            if key in self.blocked_edges:
+                edge["w"] = 1e9
+                continue
+
+            # Road-class-aware congestion weighting.
+            class_weight = {"arterial": 1.0, "ring": 0.95, "collector": 1.12, "local": 1.3}[edge["road_type"]]
+            flow = max(1.0, (vols[u] + vols[v]) / 2.0) * class_weight
+            capacity = edge["capacity"] * (1.0 + signal_boost)
+            ratio = flow / capacity
+            delay = edge["freeflow_s"] * (1 + alpha * (ratio**beta))
+            edge["w"] = max(edge["freeflow_s"], delay)
+
+    def route(self, a, b):
+        try:
+            path = nx.dijkstra_path(self.G, a, b, weight="w")
+            cost = nx.path_weight(self.G, path, weight="w")
+            if cost >= 1e8:
+                return [], None
+            return list(zip(path, path[1:])), cost
+        except nx.NetworkXNoPath:
+            return [], None
+
+
+class AIDecisionEngine:
+    def __init__(self, sim: TrafficSim, router: Router):
+        self.sim = sim
+        self.router = router
+        self.status = "ONLINE"
+        self.auto_mode = True
+        self.response_delay_s = 1.8
+        self.last_action_time = 0.0
+        self.logs = deque(maxlen=500)
+
+    def log(self, kind, msg):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.logs.appendleft(f"[{ts}] {kind:<10} {msg}")
+
+    def analyze(self, vols, origin, dest):
+        self.status = "ANALYZING"
+        priority = [n for n, _ in sorted(vols.items(), key=lambda x: x[1], reverse=True)[:3]]
+        anomalies = []
+        for node, v in vols.items():
+            s = list(self.sim.hist[node])
+            if len(s) < 12:
+                continue
+            baseline = float(np.mean(s[-12:-2]))
+            delta = v - baseline
+            if delta > 140:
+                anomalies.append((node, "surge", delta))
+            elif delta < -120:
+                anomalies.append((node, "drop", delta))
+
+        health_issues = [n for n, h in self.sim.health.items() if h.degraded]
+        _, route_cost = self.router.route(origin, dest)
+
+        efficiency_delta = 0.0
+        if route_cost:
+            self.router.update(vols, signal_boost=0.0)
+            _, base_cost = self.router.route(origin, dest)
+            self.router.update(vols, signal_boost=0.12)
+            _, adaptive_cost = self.router.route(origin, dest)
+            if base_cost and adaptive_cost:
+                efficiency_delta = (base_cost - adaptive_cost) / max(base_cost, 1)
+
+        trend = "stable"
+        hist = list(self.sim.hist[dest])
+        if len(hist) > 15:
+            prev = np.mean(hist[-15:-8])
+            curr = np.mean(hist[-7:])
+            trend = "increasing" if curr - prev > 25 else "decreasing" if prev - curr > 25 else "stable"
+
+        if anomalies:
+            self.status = "ALERT"
+            n, k, d = anomalies[0]
+            self.log("INCIDENT", f"Anomaly at {n}: {k} ({d:+.1f})")
+        elif route_cost and route_cost > 850:
+            self.status = "OPTIMIZING"
+            self.log("ROUTING", "Route optimality degraded significantly; rerouting recommended")
+
+        if health_issues:
+            self.log("HEALTH", f"Sensor degraded: {', '.join(health_issues[:4])}")
+
+        return {
+            "priority_nodes": priority,
+            "anomalies": anomalies,
+            "health_issues": health_issues,
+            "trend": trend,
+            "efficiency_delta": efficiency_delta,
+        }
+
+    def maybe_act(self, analysis):
+        if not self.auto_mode:
+            return "Autonomous mode OFF"
+        if time.time() - self.last_action_time < self.response_delay_s:
+            return "AI waiting response delay"
+
+        self.last_action_time = time.time()
+        if analysis["anomalies"]:
+            hot = analysis["anomalies"][0][0]
+            neighbors = list(self.router.G.neighbors(hot))
+            if neighbors:
+                edge = tuple(sorted((hot, neighbors[0])))
+                self.router.block_edge(edge[0], edge[1], duration=12)
+                msg = f"Auto-control blocked {edge[0]}-{edge[1]} for incident isolation"
+                self.log("ACTION", msg)
+                return msg
+        if analysis["efficiency_delta"] > 0.03:
+            msg = f"Adaptive signal timing applied, efficiency +{analysis['efficiency_delta']*100:.1f}%"
+            self.log("ACTION", msg)
+            return msg
+        return "Monitoring"
+
+
+class Dashboard:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("AI TRAFFIC CONTROL • CENTRAL COMMAND")
+        self.root.geometry("1900x1000")
+        self.root.configure(bg="#121212")
+
+        self.router = Router()
+        self.nodes = list(self.router.G.nodes())
+        self.sim = TrafficSim(self.nodes)
+        self.nn = NeuralPredictor()
+        self.ai = AIDecisionEngine(self.sim, self.router)
+        self.voice = VoiceAlert()
+        self.live = LiveTrafficIntegrator()
+        self.sim.calibrate_from_historical(self.live)
+
+        self.vols = {n: 200.0 for n in self.nodes}
+
+        self.start_node = tk.StringVar(value=self.nodes[0])
+        self.end_node = tk.StringVar(value=self.nodes[min(4, len(self.nodes) - 1)])
+        self.route_text = tk.StringVar(value="Initializing...")
+        self.ai_status = tk.StringVar(value="ONLINE")
+        self.confidence_text = tk.StringVar(value="Confidence: N/A")
+        self.trend_text = tk.StringVar(value="Trend: stable")
+        self.eff_text = tk.StringVar(value="Route Efficiency: --")
+        self.health_text = tk.StringVar(value="Sensors: healthy")
+        self.data_source_text = tk.StringVar(value="Live: Simulation only")
+        self.travel_overlay_text = tk.StringVar(value="ETA Overlay: --")
+        self.eta_gap_text = tk.StringVar(value="ETA Gap: --")
+        self.provider_status_text = tk.StringVar(value="Providers: idle")
+
+        self.auto_mode_var = tk.BooleanVar(value=True)
+        self.poll_queue: queue.Queue = queue.Queue()
+        self.poll_inflight = False
+        self.avatar_question = tk.StringVar(value="ETA summary")
+        self.avatar_message = tk.StringVar(value="Hi! I'm NavAI. Click me for route and prediction insights.")
+        self.last_eta_local = None
+        self.last_eta_google = None
+        self.last_conf = 0.0
+        self.last_trend = "stable"
+        self.last_action_msg = "Monitoring"
+
+        self._setup_layout()
+        self._panel_accident_controls()
+        self._panel_route_planning()
+        self._panel_traffic_display()
+        self._panel_avatar()
+
+        self.tick()
+
+    def _setup_layout(self):
+        self.pan_left = tk.Frame(self.root, bg="#1e1e1e", width=360)
+        self.pan_left.pack(side="left", fill="y", padx=5, pady=5)
+        self.pan_left.pack_propagate(False)
+
+        self.pan_right = tk.Frame(self.root, bg="#121212")
+        self.pan_right.pack(side="right", fill="both", expand=True, padx=5, pady=5)
+
+        self.pan_top = tk.Frame(self.pan_right, bg="#1e1e1e", height=260)
+        self.pan_top.pack(side="top", fill="x", pady=(0, 5))
+        self.pan_top.pack_propagate(False)
+
+        self.pan_btm = tk.Frame(self.pan_right, bg="#1e1e1e")
+        self.pan_btm.pack(side="bottom", fill="both", expand=True)
+
+    def _panel_accident_controls(self):
+        tk.Label(self.pan_left, text="⚠️ INCIDENT CONTROLS", font=("Helvetica", 16, "bold"), bg="#1e1e1e", fg="#ff5555").pack(pady=8)
+        ttk.Checkbutton(self.pan_left, text="AI Autonomous Control", variable=self.auto_mode_var, command=self._toggle_auto).pack(pady=4)
+
+        self.lbl_ai_state = tk.Label(self.pan_left, textvariable=self.ai_status, font=("Consolas", 12, "bold"), bg="#1e1e1e", fg="#00ff90")
+        self.lbl_ai_state.pack(pady=4)
+
+        canvas = tk.Canvas(self.pan_left, bg="#1e1e1e", highlightthickness=0)
+        scrollbar = ttk.Scrollbar(self.pan_left, orient="vertical", command=canvas.yview)
+        self.scroll_frame = tk.Frame(canvas, bg="#1e1e1e")
+        self.scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=self.scroll_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        self.edge_buttons = {}
+        for u, v in list(self.router.G.edges())[:180]:
+            key = tuple(sorted((u, v)))
+            holder = tk.Frame(self.scroll_frame, bg="#1e1e1e", pady=1)
+            holder.pack(fill="x", padx=8)
+            btn = tk.Button(holder, text=f"{u} ↔ {v}", font=("Consolas", 8), bg="#333333", fg="white", relief="flat", height=1, command=lambda k=key: self.trigger_blockage(k))
+            btn.pack(fill="x")
+            self.edge_buttons[key] = btn
+
+    def _toggle_auto(self):
+        self.ai.auto_mode = self.auto_mode_var.get()
+        self.ai.log("MODE", "Autonomous control enabled" if self.ai.auto_mode else "Autonomous control disabled")
+
+    def _panel_route_planning(self):
+        tk.Label(self.pan_top, text="🗺️ REALISTIC SIMULATED CITY ROUTE PLANNING", font=("Helvetica", 15, "bold"), bg="#1e1e1e", fg="#44aaff").pack(pady=8)
+        ctl = tk.Frame(self.pan_top, bg="#1e1e1e")
+        ctl.pack(pady=4)
+
+        tk.Label(ctl, text="ORIGIN:", font=("Arial", 11, "bold"), bg="#1e1e1e", fg="white").pack(side="left", padx=8)
+        om_from = tk.OptionMenu(ctl, self.start_node, *self.nodes)
+        om_from.config(font=("Arial", 10), bg="#333333", fg="white", width=10)
+        om_from.pack(side="left")
+
+        tk.Label(ctl, text=" ➔ ", font=("Arial", 13), bg="#1e1e1e", fg="white").pack(side="left", padx=5)
+
+        tk.Label(ctl, text="DESTINATION:", font=("Arial", 11, "bold"), bg="#1e1e1e", fg="white").pack(side="left", padx=8)
+        om_to = tk.OptionMenu(ctl, self.end_node, *self.nodes)
+        om_to.config(font=("Arial", 10), bg="#333333", fg="white", width=10)
+        om_to.pack(side="left")
+
+        self.lbl_status = tk.Label(self.pan_top, text="STATUS: ONLINE", font=("Arial", 12, "bold"), bg="#1e1e1e", fg="#00ff00")
+        self.lbl_status.pack(pady=4)
+
+        tk.Label(self.pan_top, textvariable=self.route_text, font=("Consolas", 10), bg="#222222", fg="#ffff00", wraplength=1100).pack(pady=4, fill="x", padx=20)
+
+        info = tk.Frame(self.pan_top, bg="#1e1e1e")
+        info.pack(fill="x")
+        for sv, color in [
+            (self.confidence_text, "#9ad0ff"),
+            (self.trend_text, "#ffc857"),
+            (self.eff_text, "#a3ffb5"),
+            (self.health_text, "#ff9b9b"),
+            (self.travel_overlay_text, "#cdb4ff"),
+            (self.eta_gap_text, "#ffd166"),
+        ]:
+            tk.Label(info, textvariable=sv, bg="#1e1e1e", fg=color, font=("Consolas", 9)).pack(side="left", padx=10)
+
+        tk.Label(self.pan_top, textvariable=self.provider_status_text, bg="#1e1e1e", fg="#9de0ad", font=("Consolas", 8)).pack(pady=(1, 0))
+
+
+    def _panel_avatar(self):
+        self.avatar_panel = tk.Frame(self.pan_btm, bg="#0f1720", bd=1, relief="ridge")
+        self.avatar_panel.place(relx=0.985, rely=0.985, anchor="se")
+
+        tk.Label(self.avatar_panel, text="NAV AI ASSISTANT", font=("Consolas", 9, "bold"), bg="#0f1720", fg="#8bd3ff").pack(pady=(6, 2), padx=8)
+
+        self.avatar_canvas = tk.Canvas(self.avatar_panel, width=68, height=68, bg="#0f1720", highlightthickness=0, cursor="hand2")
+        self.avatar_canvas.pack()
+        self.avatar_canvas.create_oval(10, 8, 58, 56, fill="#2f4b7c", outline="#90caf9", width=2)
+        self.avatar_canvas.create_oval(24, 24, 30, 30, fill="white", outline="")
+        self.avatar_canvas.create_oval(38, 24, 44, 30, fill="white", outline="")
+        self.avatar_canvas.create_arc(22, 30, 46, 48, start=200, extent=140, style="arc", outline="#d4f1ff", width=2)
+
+        qbar = tk.Frame(self.avatar_panel, bg="#0f1720")
+        qbar.pack(fill="x", padx=6, pady=4)
+        tk.OptionMenu(qbar, self.avatar_question, "ETA summary", "Prediction outlook", "Traffic health", "Best action").pack(side="left")
+        tk.Button(qbar, text="Ask", command=self._on_avatar_interact, bg="#1f2f4a", fg="white", relief="flat").pack(side="left", padx=4)
+
+        action_bar = tk.Frame(self.avatar_panel, bg="#0f1720")
+        action_bar.pack(fill="x", padx=6, pady=(0, 4))
+        tk.Button(action_bar, text="Why?", command=self._on_avatar_why, bg="#2b3f61", fg="white", relief="flat").pack(side="left")
+        tk.Button(action_bar, text="Apply Reroute", command=lambda: self._on_avatar_action("reroute"), bg="#2f855a", fg="white", relief="flat").pack(side="left", padx=4)
+        tk.Button(action_bar, text="Silence 5m", command=lambda: self._on_avatar_action("silence"), bg="#7b341e", fg="white", relief="flat").pack(side="left")
+
+        self.avatar_bubble = tk.Label(self.avatar_panel, textvariable=self.avatar_message, justify="left", wraplength=260, font=("Consolas", 8), bg="#111827", fg="#d6f3ff")
+        self.avatar_bubble.pack(fill="x", padx=6, pady=(0, 7))
+
+        self.avatar_canvas.bind("<Button-1>", lambda _e: self._on_avatar_interact())
+
+    def _avatar_response(self):
+        ask = self.avatar_question.get()
+        eta_local = f"{self.last_eta_local:.1f} min" if self.last_eta_local is not None else "N/A"
+        eta_google = f"{self.last_eta_google:.1f} min" if self.last_eta_google is not None else "N/A"
+        conf = f"{self.last_conf*100:.1f}%" if self.last_conf else "warming"
+
+        if ask == "ETA summary":
+            return f"ETA check: Dijkstra {eta_local}; Google {eta_google}. {self.eta_gap_text.get()}."
+        if ask == "Prediction outlook":
+            return f"Prediction is {self.last_trend} with confidence {conf}."
+        if ask == "Traffic health":
+            return f"System health: {self.health_text.get()}. Data feed: {self.data_source_text.get()}."
+        return f"Recommended action: {self.last_action_msg}."
+
+    def _on_avatar_interact(self):
+        msg = self._avatar_response()
+        self.avatar_message.set(msg)
+        self.ai.log("AVATAR", msg)
+
+    def _on_avatar_why(self):
+        why = f"Why: AI={self.ai_status.get()}, {self.eta_gap_text.get()}, trend={self.last_trend}, confidence={self.last_conf*100:.1f}%"
+        self.avatar_message.set(why)
+        self.ai.log("AVATAR", why)
+
+    def _on_avatar_action(self, action: str):
+        if action == "reroute":
+            self.ai.log("AVATAR", "Operator accepted reroute recommendation")
+            self.avatar_message.set("Reroute acknowledged. AI will prioritize lowest ETA corridors.")
+        elif action == "silence":
+            self.voice._last_spoken = time.time() + 300
+            self.ai.log("AVATAR", "Voice alerts muted for 5 minutes")
+            self.avatar_message.set("Voice alerts muted for five minutes.")
+
+    def _launch_live_poll(self, origin_xy, dest_xy):
+        if self.poll_inflight:
+            return
+
+        def worker():
+            self.live.poll_all(origin_xy, dest_xy)
+            self.poll_queue.put("done")
+
+        self.poll_inflight = True
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _consume_live_poll_result(self):
+        got = False
+        while True:
+            try:
+                self.poll_queue.get_nowait()
+            except queue.Empty:
+                break
+            got = True
+
+        if got:
+            self.poll_inflight = False
+            if self.live.live_mode:
+                self.ai.log("LIVE", "Fetched TomTom/HERE/Google feeds")
+            else:
+                self.ai.log("WARN", "Live API unavailable; reverting to simulation")
+
+    def _panel_traffic_display(self):
+        self.frame_graph = tk.Frame(self.pan_btm, bg="#000000")
+        self.frame_graph.pack(side="left", fill="both", expand=True)
+
+        self.frame_metrics = tk.Frame(self.pan_btm, bg="#1e1e1e", width=600)
+        self.frame_metrics.pack(side="right", fill="y")
+        self.frame_metrics.pack_propagate(False)
+
+        self.figN, self.axN = plt.subplots(figsize=(6, 6))
+        self.figN.patch.set_facecolor("#000000")
+        self.axN.set_facecolor("#000000")
+        self.axN.axis("off")
+
+        self.pos = {n: (self.router.G.nodes[n]["x"], self.router.G.nodes[n]["y"]) for n in self.nodes}
+        self.canvasN = FigureCanvasTkAgg(self.figN, self.frame_graph)
+        self.canvasN.get_tk_widget().pack(fill="both", expand=True)
+
+        tk.Label(self.frame_metrics, text="LIVE METRICS + AI CONSOLE", font=("Helvetica", 12, "bold"), bg="#1e1e1e", fg="white").pack(pady=6)
+
+        self.figF, self.axF = plt.subplots(figsize=(5, 2.2))
+        self.figF.patch.set_facecolor("#1e1e1e")
+        self.axF.set_facecolor("#121212")
+        self.axF.tick_params(colors="white", labelsize=8)
+        self.axF.set_title("Prediction + Real vs Sim", color="white", fontsize=10)
+        self.pred_hist_line, = self.axF.plot([], [], color="#00ffff", lw=1.8, label="Blended")
+        self.pred_horizon_line, = self.axF.plot([], [], color="#ff9f1c", lw=2, label="Horizon")
+        self.real_line, = self.axF.plot([], [], color="#3ddc97", lw=1.6, label="Real scaled")
+        self.sim_line, = self.axF.plot([], [], "--", color="#9aa0a6", lw=1.2, label="Simulated")
+        self.axF.legend(loc="upper left", fontsize=7)
+
+        self.canvasF = FigureCanvasTkAgg(self.figF, self.frame_metrics)
+        self.canvasF.get_tk_widget().pack(fill="x", padx=10)
+
+        topbar = tk.Frame(self.frame_metrics, bg="#1e1e1e")
+        topbar.pack(fill="x", padx=10)
+        self.clock = tk.Label(topbar, text="00:00:00", font=("Consolas", 20), bg="#1e1e1e", fg="white")
+        self.clock.pack(side="left")
+        tk.Label(topbar, textvariable=self.data_source_text, font=("Consolas", 9), bg="#1e1e1e", fg="#72efdd").pack(side="left", padx=10)
+
+        self.console = tk.Text(self.frame_metrics, bg="#101010", fg="#4cff4c", font=("Consolas", 9), height=11, relief="flat")
+        self.console.pack(fill="x", padx=10, pady=6)
+
+    def log_console(self, live_message=""):
+        self.console.delete("1.0", "20.0")
+        for row in list(self.ai.logs)[:16]:
+            self.console.insert("end", row + "\n")
+        if self.live.last_error:
+            self.console.insert("end", f"[WARN] API fallback: {self.live.last_error}\n")
+        self.console.insert("end", f"[LIVE] {live_message}\n")
+
+    def trigger_blockage(self, edge_key):
+        self.router.block_edge(edge_key[0], edge_key[1], BLOCK_DURATION)
+        self.edge_buttons[edge_key].config(bg="#ff0000", fg="white", text=f"⛔ {edge_key[0]}-{edge_key[1]}")
+        msg = f"Manual blockage on {edge_key[0]}-{edge_key[1]}"
+        self.ai.log("MANUAL", msg)
+        self.voice.speak(msg)
+
+    def _origin_dest_xy(self):
+        a = self.start_node.get()
+        b = self.end_node.get()
+        return (self.pos[a][0], self.pos[a][1]), (self.pos[b][0], self.pos[b][1])
+
+    def draw_network(self):
+        self.axN.clear()
+        self.axN.axis("off")
+
+        blocked = self.router.blocked_edges.keys()
+        edges_normal = [e for e in self.router.G.edges() if tuple(sorted(e)) not in blocked]
+        nx.draw_networkx_edges(self.router.G, self.pos, edgelist=edges_normal, ax=self.axN, alpha=0.12, edge_color="#666", width=1)
+
+        blocked_edges = [e for e in self.router.G.edges() if tuple(sorted(e)) in blocked]
+        if blocked_edges:
+            nx.draw_networkx_edges(self.router.G, self.pos, edgelist=blocked_edges, ax=self.axN, alpha=0.8, edge_color="#ff0000", width=3, style="dotted")
+
+        vals = np.array(list(self.vols.values()))
+        norm = np.clip(vals / MAX_VOL, 0, 1)
+        colors = [(n, 1 - n, 0.2) for n in norm]
+
+        nx.draw_networkx_nodes(self.router.G, self.pos, ax=self.axN, node_size=90, node_color=colors, edgecolors="white", linewidths=0.3)
+
+        path_edges, route_cost = self.router.route(self.start_node.get(), self.end_node.get())
+        if path_edges:
+            for u, v in path_edges:
+                self.axN.add_patch(FancyArrowPatch(self.pos[u], self.pos[v], color="#00ffcc", linewidth=2.8, alpha=0.8, arrowstyle="-"))
+
+            eta_local = (route_cost / 60.0) if route_cost else 0
+            eta_google = self.live.google_eta_s / 60.0 if self.live.google_eta_s else None
+            overlay = f" | Google ETA: {eta_google:.1f}m" if eta_google else ""
+            self.route_text.set(f"Route edges: {len(path_edges)} | Dijkstra ETA: {eta_local:.1f}m{overlay}")
+            self.travel_overlay_text.set(f"ETA Overlay: Dijkstra {eta_local:.1f}m" + (f" vs Google {eta_google:.1f}m" if eta_google else ""))
+            self.last_eta_local = eta_local
+            self.last_eta_google = eta_google
+            if eta_google is not None:
+                gap = eta_google - eta_local
+                self.eta_gap_text.set(f"ETA Gap: {gap:+.1f}m")
+            else:
+                self.eta_gap_text.set("ETA Gap: N/A")
+            self.lbl_status.config(text="STATUS: ROUTE ACTIVE", fg="#00ffcc")
+        else:
+            self.route_text.set("⛔ NO ROUTE AVAILABLE")
+            self.lbl_status.config(text="STATUS: ALERT", fg="#ff0000")
+
+    def tick(self):
+        origin_xy, dest_xy = self._origin_dest_xy()
+        if self.live.should_poll():
+            self._launch_live_poll(origin_xy, dest_xy)
+        self._consume_live_poll_result()
+
+        for lat, lon in self.live.incident_points:
+            edge = self.router.block_incident_near(lat, lon, duration=45)
+            if edge:
+                self.ai.log("INCIDENT", f"HERE incident blocked edge {edge[0]}-{edge[1]}")
+
+        if self.live.social_incidents:
+            self.ai.log("SOCIAL", f"X incident signals: {len(self.live.social_incidents)} posts")
+
+        self.vols, sim_only = self.sim.step(self.live.speed_factor if self.live.live_mode else 1.0)
+        active_blocks = self.router.check_blocks()
+        self.router.update(self.vols)
+
+        for n, v in self.vols.items():
+            self.nn.update(n, v)
+
+        analysis = self.ai.analyze(self.vols, self.start_node.get(), self.end_node.get())
+        action = self.ai.maybe_act(analysis)
+        self.last_action_msg = action
+
+        self.ai_status.set(self.ai.status)
+        color_map = {"ONLINE": "#00ff90", "ANALYZING": "#00bcd4", "ALERT": "#ff5252", "OPTIMIZING": "#ffc107"}
+        self.lbl_ai_state.config(fg=color_map.get(self.ai.status, "white"))
+
+        now = time.time()
+        for key, btn in self.edge_buttons.items():
+            if key in active_blocks:
+                remaining = int(active_blocks[key] - now)
+                btn.config(bg="#aa0000", text=f"⛔ {key[0]}-{key[1]} ({remaining}s)")
+            else:
+                btn.config(bg="#333333", fg="white", text=f"{key[0]} ↔ {key[1]}")
+
+        target = self.end_node.get()
+        hist_y = list(self.sim.hist[target])
+        pred = self.nn.predict(target)
+        for collection in self.axF.collections[:]:
+            collection.remove()
+
+        if pred[0] is not None:
+            _, s, horizon, conf = pred
+            x_hist = range(len(hist_y))
+            x_pred = range(len(hist_y), len(hist_y) + len(horizon))
+            self.pred_hist_line.set_data(x_hist, hist_y)
+            self.pred_horizon_line.set_data(x_pred, horizon)
+            self.real_line.set_data(x_hist, list(self.sim.hist_real[target]))
+            self.sim_line.set_data(x_hist, list(self.sim.hist_sim[target]))
+            self.axF.fill_between(x_pred, np.array(horizon) - 2 * s, np.array(horizon) + 2 * s, color="#00ffff", alpha=0.2)
+            self.last_conf = conf
+            self.confidence_text.set(f"Confidence: {conf*100:.1f}%")
+            if np.mean(horizon[:4]) > 680:
+                warning = f"Predictive congestion warning at {target}."
+                self.ai.log("PREDICT", warning)
+                self.voice.speak(warning)
+        else:
+            self.confidence_text.set("Confidence: warming up model")
+
+        self.axF.set_xlim(max(0, len(hist_y) - 60), len(hist_y) + PRED_HORIZON)
+        self.axF.set_ylim(0, 1000)
+
+        self.last_trend = analysis["trend"]
+        self.trend_text.set(f"Trend: {analysis['trend']}")
+        self.eff_text.set(f"Route Efficiency: {analysis['efficiency_delta']*100:+.1f}%")
+        self.health_text.set("Sensors: degraded" if analysis["health_issues"] else "Sensors: healthy")
+        self.data_source_text.set(self.live.live_badge())
+        self.provider_status_text.set(self.live.provider_badge())
+
+        if analysis["anomalies"]:
+            self.voice.speak("Incident detected. Autonomous control evaluating response.")
+
+        self.log_console(f"Priority: {', '.join(analysis['priority_nodes'])} | {action}")
+
+        self.clock.config(text=datetime.now().strftime("%H:%M:%S"))
+        self.draw_network()
+        self.canvasN.draw_idle()
+        self.canvasF.draw_idle()
+        self.root.after(UPDATE_MS, self.tick)
+
+    def run(self):
+        self.root.mainloop()
+
+
+if __name__ == "__main__":
+    Dashboard().run()
