@@ -1,0 +1,82 @@
+.traffic-map {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
+
+.map-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 1rem;
+}
+
+.map-header h2 {
+  font-size: 1.2rem;
+  font-weight: 600;
+  color: #1e293b;
+}
+
+.route-info {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  background: linear-gradient(135deg, #06b6d4 0%, #3b82f6 100%);
+  padding: 0.5rem 1rem;
+  border-radius: 8px;
+  color: white;
+}
+
+.route-label {
+  font-size: 0.85rem;
+  opacity: 0.9;
+}
+
+.route-value {
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+
+.traffic-map canvas {
+  flex: 1;
+  border-radius: 8px;
+  background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
+}
+
+.legend {
+  display: flex;
+  gap: 1.5rem;
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid #e2e8f0;
+  flex-wrap: wrap;
+}
+
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+  color: #64748b;
+}
+
+.legend-color {
+  width: 40px;
+  height: 12px;
+  border-radius: 6px;
+}
+
+.legend-line {
+  width: 30px;
+  height: 3px;
+  border-radius: 2px;
+}
+
+.legend-line.blocked {
+  background: #ef4444;
+}
+
+.legend-line.route {
+  background: #06b6d4;
+}

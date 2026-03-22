@@ -1,0 +1,144 @@
+.ai-assistant {
+  background: white;
+  border-radius: 16px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
+  overflow: hidden;
+  transition: all 0.3s ease;
+}
+
+.assistant-header {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  padding: 1.25rem 1.5rem;
+  cursor: pointer;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  user-select: none;
+}
+
+.assistant-title {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.assistant-icon {
+  width: 40px;
+  height: 40px;
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: white;
+}
+
+.assistant-title h3 {
+  color: white;
+  font-size: 1.1rem;
+  font-weight: 600;
+  margin: 0;
+  margin-bottom: 0.2rem;
+}
+
+.assistant-status {
+  color: rgba(255, 255, 255, 0.9);
+  font-size: 0.8rem;
+}
+
+.expand-icon {
+  color: white;
+  font-size: 1.5rem;
+  font-weight: 300;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 6px;
+}
+
+.assistant-content {
+  max-height: 0;
+  overflow: hidden;
+  transition: max-height 0.3s ease;
+}
+
+.ai-assistant.expanded .assistant-content {
+  max-height: 600px;
+}
+
+.logs-container {
+  padding: 1rem 1.5rem;
+  max-height: 250px;
+  overflow-y: auto;
+  background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
+}
+
+.log-entry {
+  padding: 0.75rem;
+  background: white;
+  border-left: 3px solid;
+  border-radius: 6px;
+  margin-bottom: 0.5rem;
+  font-family: monospace;
+  font-size: 0.75rem;
+  color: #475569;
+  line-height: 1.4;
+  transition: transform 0.2s;
+}
+
+.log-entry:hover {
+  transform: translateX(2px);
+}
+
+.log-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.log-empty {
+  text-align: center;
+  color: #94a3b8;
+  padding: 2rem;
+  font-style: italic;
+}
+
+.assistant-insights {
+  padding: 1rem 1.5rem 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.insight-item {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.875rem;
+  background: linear-gradient(135deg, rgba(102, 126, 234, 0.05) 0%, rgba(118, 75, 162, 0.05) 100%);
+  border-radius: 10px;
+  border: 1px solid rgba(102, 126, 234, 0.1);
+}
+
+.insight-icon {
+  font-size: 1.5rem;
+}
+
+.insight-text {
+  flex: 1;
+}
+
+.insight-label {
+  font-size: 0.75rem;
+  color: #64748b;
+  font-weight: 500;
+  margin-bottom: 0.25rem;
+}
+
+.insight-value {
+  font-size: 0.95rem;
+  color: #1e293b;
+  font-weight: 600;
+}
