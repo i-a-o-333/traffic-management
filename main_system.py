@@ -7,7 +7,6 @@ from datetime import datetime
 
 import networkx as nx
 import numpy as np
-import requests
 import torch
 import torch.nn as nn
 
@@ -397,22 +396,6 @@ class Router:
 
     def block_edge(self, u, v, duration=30):
         self.blocked_edges[self.normalize_edge(u, v)] = time.time() + duration
-
-    def block_incident_near(self, lat: float, lon: float, duration=45):
-        nearest = None
-        nearest_distance = 1e9
-        for u, v in self.G.edges():
-            ux, uy = self.G.nodes[u]["x"], self.G.nodes[u]["y"]
-            vx, vy = self.G.nodes[v]["x"], self.G.nodes[v]["y"]
-            cx, cy = (ux + vx) / 2.0, (uy + vy) / 2.0
-            distance = (cx - lon) ** 2 + (cy - lat) ** 2
-            if distance < nearest_distance:
-                nearest_distance = distance
-                nearest = (u, v)
-        if nearest:
-            self.block_edge(nearest[0], nearest[1], duration)
-            return nearest
-        return None
 
     def check_blocks(self):
         now = time.time()
