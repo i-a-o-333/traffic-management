@@ -89,6 +89,8 @@ class NeuralPredictor:
 
 
 class LiveTrafficIntegrator:
+    """Live data from TomTom/X/HERE/Google with resilient fallbacks."""
+
     def __init__(self):
         self.tomtom_key = os.getenv("TOMTOM_API_KEY")
         self.here_key = os.getenv("HERE_API_KEY")
@@ -108,6 +110,131 @@ class LiveTrafficIntegrator:
         self.provider_status = {"TomTom": "idle", "HERE": "idle", "X": "idle", "Google": "idle"}
         self.last_latency_ms = 0
 
+    def should_poll(self):
+        return time.time() - self.last_poll >= self.next_poll_s
+
+    def poll_all(self, origin_xy: tuple[float, float] | None, dest_xy: tuple[float, float] | None):
+        self.last_poll = time.time()
+        self.next_poll_s = random.randint(30, 60)
+        started = time.time()
+        self.last_error = ""
+
+        success = False
+
+        try:
+            self.speed_factor = self.fetch_tomtom_speed_factor()
+            self.provider_status["TomTom"] = "ok"
+            success = True
+        except Exception as exc:
+            self.provider_status["TomTom"] = "degraded"
+            self.last_error = f"TomTom: {exc}"
+            self.speed_factor = 1.0
+
+        try:
+            self.incident_points = self.fetch_here_incidents(origin_xy)
+            self.provider_status["HERE"] = "ok"
+            success = True
+        except Exception as exc:
+            self.provider_status["HERE"] = "degraded"
+            self.last_error = f"{self.last_error} | HERE: {exc}".strip(" |")
+            self.incident_points = []
+
+        try:
+            self.social_incidents = self.fetch_x_incidents()
+            self.provider_status["X"] = "ok" if self.social_incidents is not None else "degraded"
+            success = True
+        except Exception as exc:
+            self.provider_status["X"] = "degraded"
+            self.last_error = f"{self.last_error} | X: {exc}".strip(" |")
+            self.social_incidents = []
+
+        try:
+            self.google_eta_s = self.fetch_google_eta(origin_xy, dest_xy)
+            self.provider_status["Google"] = "ok"
+            success = True
+        except Exception as exc:
+            self.provider_status["Google"] = "degraded"
+            self.last_error = f"{self.last_error} | Google: {exc}".strip(" |")
+            self.google_eta_s = None
+
+        self.live_mode = success
+        if success:
+            self.last_success = time.time()
+        self.last_latency_ms = int((time.time() - started) * 1000)
+
+    def fetch_tomtom_speed_factor(self) -> float:
+        if not self.tomtom_key:
+            raise RuntimeError("TOMTOM_API_KEY missing")
+        lat, lon = 12.9716, 77.5946
+        url = f"https://api.tomtom.com/traffic/services/4/flowSegmentData/absolute/10/json?point={lat},{lon}&key={self.tomtom_key}"
+        resp = requests.get(url, timeout=8)
+        resp.raise_for_status()
+        data = resp.json().get("flowSegmentData", {})
+        current = float(data.get("currentSpeed", 0) or 0)
+        freeflow = max(1.0, float(data.get("freeFlowSpeed", 1) or 1))
+        if current <= 0:
+            raise RuntimeError("TomTom missing currentSpeed")
+        jam_factor = np.clip(1.0 - (current / freeflow), 0.0, 1.0)
+        return float(np.clip(1.0 - jam_factor * 0.65, 0.2, 1.0))
+
+    def fetch_here_incidents(self, origin_xy: tuple[float, float] | None):
+        if not self.here_key or not origin_xy:
+            return []
+        lon, lat = origin_xy
+        bbox = f"{lat-0.08},{lon-0.08},{lat+0.08},{lon+0.08}"
+        url = f"https://data.traffic.hereapi.com/v7/incidents?in=bbox:{bbox}&apiKey={self.here_key}"
+        resp = requests.get(url, timeout=8)
+        resp.raise_for_status()
+        data = resp.json()
+        points = []
+        for item in data.get("results", [])[:20]:
+            loc = item.get("location", {})
+            lat_ = loc.get("lat")
+            lon_ = loc.get("lng")
+            if lat_ is not None and lon_ is not None:
+                points.append((lat_, lon_))
+        return points
+
+    def fetch_x_incidents(self):
+        if not self.x_bearer:
+            return []
+        query = '("traffic jam Bengaluru" OR "accident Bengaluru highway") filter:news since:2025-02-01'
+        url = "https://api.x.com/2/tweets/search/recent"
+        headers = {"Authorization": f"Bearer {self.x_bearer}"}
+        params = {"query": query, "max_results": 10}
+        resp = requests.get(url, headers=headers, params=params, timeout=8)
+        resp.raise_for_status()
+        data = resp.json()
+        return [item.get("text", "") for item in data.get("data", [])]
+
+    def fetch_google_eta(self, origin_xy: tuple[float, float] | None, dest_xy: tuple[float, float] | None):
+        if not self.google_key or not origin_xy or not dest_xy:
+            return None
+        origin = f"{origin_xy[1]},{origin_xy[0]}"
+        dest = f"{dest_xy[1]},{dest_xy[0]}"
+        url = "https://maps.googleapis.com/maps/api/directions/json"
+        params = {"origin": origin, "destination": dest, "departure_time": "now", "key": self.google_key}
+        resp = requests.get(url, params=params, timeout=8)
+        resp.raise_for_status()
+        data = resp.json()
+        routes = data.get("routes", [])
+        if not routes:
+            return None
+        legs = routes[0].get("legs", [])
+        if not legs:
+            return None
+        return legs[0].get("duration_in_traffic", {}).get("value") or legs[0].get("duration", {}).get("value")
+
+    def live_badge(self):
+        if self.live_mode:
+            age = int(time.time() - self.last_success)
+            return f"Live: TomTom • Updated {age}s ago"
+        return "Live: Simulation only"
+
+    def provider_badge(self):
+        parts = [f"{name}:{'OK' if status == 'ok' else 'WARN'}" for name, status in self.provider_status.items()]
+        return " | ".join(parts) + f" | Latency:{self.last_latency_ms}ms"
+
 
 class TrafficSim:
     def __init__(self, nodes):
@@ -120,6 +247,12 @@ class TrafficSim:
         self.ema = {n: 200.0 for n in self.nodes}
         self.health = {n: SensorHealth() for n in self.nodes}
         self.last_context = "Clear"
+
+    def calibrate_from_historical(self, traffic_integrator: LiveTrafficIntegrator):
+        if traffic_integrator.tomtom_key:
+            self.cfg.morning_peak = (7, 11)
+            self.cfg.evening_peak = (16, 21)
+            self.cfg.weekend_drop = 0.78
 
     def _hour_multiplier(self, now: datetime) -> float:
         hour = now.hour + now.minute / 60.0
