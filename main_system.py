@@ -7,7 +7,6 @@ from datetime import datetime
 
 import networkx as nx
 import numpy as np
-import requests
 import torch
 import torch.nn as nn
 
@@ -17,10 +16,6 @@ ROAD_SPECS = {
     "local": {"speed": 30, "lanes": 1, "class_weight": 1.3},
     "ring": {"speed": 48, "lanes": 2, "class_weight": 0.95},
 }
-HISTORY_LENGTH = 120
-DEFAULT_VOLUME = 200.0
-MAX_VOLUME = 890
-SENSOR_DROPOUT_PROBABILITY = 0.015
 
 
 @dataclass
@@ -253,25 +248,11 @@ class TrafficSim:
         self.health = {n: SensorHealth() for n in self.nodes}
         self.last_context = "Clear"
 
-    def _build_history_buffers(self):
-        return {node: deque([DEFAULT_VOLUME] * HISTORY_LENGTH, maxlen=HISTORY_LENGTH) for node in self.nodes}
-
     def calibrate_from_historical(self, traffic_integrator: LiveTrafficIntegrator):
         if traffic_integrator.tomtom_key:
             self.cfg.morning_peak = (7, 11)
             self.cfg.evening_peak = (16, 21)
             self.cfg.weekend_drop = 0.78
-
-    def _update_sensor_health(self, node: str, effective_volume: float):
-        health = self.health[node]
-        if random.random() < SENSOR_DROPOUT_PROBABILITY:
-            effective_volume = self.ema[node]
-            health.dropouts += 1
-            health.quality = max(0.2, health.quality - 0.08)
-        else:
-            health.quality = min(1.0, health.quality + 0.01)
-        health.degraded = health.quality < 0.55
-        return effective_volume
 
     def _hour_multiplier(self, now: datetime) -> float:
         hour = now.hour + now.minute / 60.0
@@ -309,9 +290,17 @@ class TrafficSim:
             base = 220 + 40 * np.sin(t / 60)
             wave = 120 * np.sin(t / 10 + self.phase[index])
             noise = np.random.normal(0, 15)
-            simulated_volume = np.clip((base + wave + noise) * demand_multiplier * weather_factor * event_factor, 30, MAX_VOLUME)
+            simulated_volume = np.clip((base + wave + noise) * demand_multiplier * weather_factor * event_factor, 30, 890)
             effective_volume = simulated_volume * speed_factor
-            effective_volume = self._update_sensor_health(node, effective_volume)
+
+            health = self.health[node]
+            if random.random() < 0.015:
+                effective_volume = self.ema[node]
+                health.dropouts += 1
+                health.quality = max(0.2, health.quality - 0.08)
+            else:
+                health.quality = min(1.0, health.quality + 0.01)
+            health.degraded = health.quality < 0.55
 
             self.ema[node] = 0.2 * effective_volume + 0.8 * self.ema[node]
             smoothed_volume = float(self.ema[node])
@@ -407,22 +396,6 @@ class Router:
 
     def block_edge(self, u, v, duration=30):
         self.blocked_edges[self.normalize_edge(u, v)] = time.time() + duration
-
-    def block_incident_near(self, lat: float, lon: float, duration=45):
-        nearest = None
-        nearest_distance = 1e9
-        for u, v in self.G.edges():
-            ux, uy = self.G.nodes[u]["x"], self.G.nodes[u]["y"]
-            vx, vy = self.G.nodes[v]["x"], self.G.nodes[v]["y"]
-            cx, cy = (ux + vx) / 2.0, (uy + vy) / 2.0
-            distance = (cx - lon) ** 2 + (cy - lat) ** 2
-            if distance < nearest_distance:
-                nearest_distance = distance
-                nearest = (u, v)
-        if nearest:
-            self.block_edge(nearest[0], nearest[1], duration)
-            return nearest
-        return None
 
     def check_blocks(self):
         now = time.time()
