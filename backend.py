@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from main_system import TrafficSim, Router, NeuralPredictor, AIDecisionEngine, LiveTrafficIntegrator
+import os
 
 app = FastAPI()
 
@@ -17,7 +18,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-router = Router()
+USE_REAL_CITY = os.getenv("USE_REAL_CITY", "false").lower() == "true"
+CITY_NAME = os.getenv("CITY_NAME", "San Francisco")
+
+router = Router(use_real_city=USE_REAL_CITY, city_name=CITY_NAME)
 nodes = router.nodes
 sim = TrafficSim(nodes)
 nn = NeuralPredictor()
@@ -165,6 +169,16 @@ async def get_live_status():
         "last_latency_ms": live.last_latency_ms,
         "incident_count": len(live.incident_points),
         "social_incidents": len(live.social_incidents),
+    }
+
+
+@app.get("/api/config")
+async def get_config():
+    return {
+        "use_real_city": USE_REAL_CITY,
+        "city_name": CITY_NAME,
+        "node_count": len(nodes),
+        "edge_count": router.G.number_of_edges(),
     }
 
 

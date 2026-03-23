@@ -223,7 +223,29 @@ pip install -r requirements.txt
 npm install
 ```
 
-### 3. Start the backend
+### 3. Configure city settings (optional)
+
+Copy `.env.example` to `.env` and configure:
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` to choose a city:
+
+```bash
+USE_REAL_CITY=true
+CITY_NAME=San Francisco
+```
+
+Available cities:
+- San Francisco (15 landmarks including Downtown, Mission, SOMA, Marina)
+- New York (15 landmarks including Midtown, Times Square, Wall Street)
+- London (15 landmarks including Westminster, City, Camden)
+
+Leave `USE_REAL_CITY=false` for the original simulated 8x6 grid.
+
+### 4. Start the backend
 
 ```bash
 python backend.py
@@ -231,7 +253,7 @@ python backend.py
 
 The API server starts on `http://localhost:8000`.
 
-### 4. Start the frontend
+### 5. Start the frontend
 
 ```bash
 npm run dev
@@ -254,12 +276,14 @@ The Vite app starts on `http://localhost:5173`.
 
 The code includes placeholders for external traffic/data providers via environment variables:
 
-- `TOMTOM_API_KEY`
-- `HERE_API_KEY`
-- `GOOGLE_MAPS_API_KEY`
-- `X_BEARER_TOKEN`
+- `USE_REAL_CITY` - Set to `true` to use real city networks instead of grid
+- `CITY_NAME` - Choose from: San Francisco, New York, London
+- `TOMTOM_API_KEY` - TomTom traffic flow API key
+- `HERE_API_KEY` - HERE incident reporting API key
+- `GOOGLE_MAPS_API_KEY` - Google Maps directions API key
+- `X_BEARER_TOKEN` - X (Twitter) API bearer token for social incident detection
 
-At the moment, these values primarily support the live integration state object and show where external providers could be connected in a future extension.
+The real city mode uses actual landmark coordinates and calculates realistic road networks using the Haversine formula for distances. Each city has 15 major landmarks connected by arterial, collector, and local roads based on actual distances.
 
 ## Why this README is useful for showcasing the project
 

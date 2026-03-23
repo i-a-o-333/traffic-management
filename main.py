@@ -12,6 +12,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.patches import FancyArrowPatch
 
 from main_system import AIDecisionEngine, LiveTrafficIntegrator, NeuralPredictor, Router, TrafficSim
+import os
 
 plt.style.use("dark_background")
 
@@ -19,6 +20,9 @@ MAX_VOL = 900
 UPDATE_MS = 1000
 BLOCK_DURATION = 30
 PRED_HORIZON = 12
+
+USE_REAL_CITY = os.getenv("USE_REAL_CITY", "false").lower() == "true"
+CITY_NAME = os.getenv("CITY_NAME", "San Francisco")
 
 
 class VoiceAlert:
@@ -52,11 +56,12 @@ class VoiceAlert:
 class Dashboard:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("AI TRAFFIC CONTROL • CENTRAL COMMAND")
+        city_title = f"AI TRAFFIC CONTROL • {CITY_NAME.upper() if USE_REAL_CITY else 'SIMULATED CITY'}"
+        self.root.title(city_title)
         self.root.geometry("1900x1000")
         self.root.configure(bg="#121212")
 
-        self.router = Router()
+        self.router = Router(use_real_city=USE_REAL_CITY, city_name=CITY_NAME)
         self.nodes = list(self.router.G.nodes())
         self.sim = TrafficSim(self.nodes)
         self.nn = NeuralPredictor()
@@ -142,9 +147,6 @@ class Dashboard:
     def _toggle_auto(self):
         self.ai.auto_mode = self.auto_mode_var.get()
         self.ai.log("MODE", "Autonomous control enabled" if self.ai.auto_mode else "Autonomous control disabled")
-
-    def _set_status_text(self, text: str, color: str):
-        self.lbl_status.config(text=text, fg=color)
 
     def _panel_route_planning(self):
         tk.Label(self.pan_top, text="🗺️ REALISTIC SIMULATED CITY ROUTE PLANNING", font=("Helvetica", 15, "bold"), bg="#1e1e1e", fg="#44aaff").pack(pady=8)
@@ -271,69 +273,6 @@ class Dashboard:
             else:
                 self.ai.log("WARN", "Live API unavailable; reverting to simulation")
 
-    def _update_edge_buttons(self, active_blocks, now: float):
-        for key, btn in self.edge_buttons.items():
-            if key in active_blocks:
-                remaining = int(active_blocks[key] - now)
-                btn.config(bg="#aa0000", text=f"⛔ {key[0]}-{key[1]} ({remaining}s)")
-            else:
-                btn.config(bg="#333333", fg="white", text=f"{key[0]} ↔ {key[1]}")
-
-    def _render_prediction_panel(self, target: str, analysis):
-        hist_y = list(self.sim.hist[target])
-        prediction = self.nn.predict(target)
-        for collection in self.axF.collections[:]:
-            collection.remove()
-
-        if prediction[0] is not None:
-            _, std_dev, horizon, conf = prediction
-            x_hist = range(len(hist_y))
-            x_pred = range(len(hist_y), len(hist_y) + len(horizon))
-            self.pred_hist_line.set_data(x_hist, hist_y)
-            self.pred_horizon_line.set_data(x_pred, horizon)
-            self.real_line.set_data(x_hist, list(self.sim.hist_real[target]))
-            self.sim_line.set_data(x_hist, list(self.sim.hist_sim[target]))
-            self.axF.fill_between(x_pred, np.array(horizon) - 2 * std_dev, np.array(horizon) + 2 * std_dev, color="#00ffff", alpha=0.2)
-            self.last_conf = conf
-            self.confidence_text.set(f"Confidence: {conf*100:.1f}%")
-            if np.mean(horizon[:4]) > 680:
-                warning = f"Predictive congestion warning at {target}."
-                self.ai.log("PREDICT", warning)
-                self.voice.speak(warning)
-        else:
-            self.confidence_text.set("Confidence: warming up model")
-
-        self.axF.set_xlim(max(0, len(hist_y) - 60), len(hist_y) + PRED_HORIZON)
-        self.axF.set_ylim(0, 1000)
-        self.last_trend = analysis["trend"]
-
-    def _update_metric_labels(self, analysis, action: str):
-        self.trend_text.set(f"Trend: {analysis['trend']}")
-        self.eff_text.set(f"Route Efficiency: {analysis['efficiency_delta']*100:+.1f}%")
-        self.health_text.set("Sensors: degraded" if analysis["health_issues"] else "Sensors: healthy")
-        self.data_source_text.set(self.live.live_badge())
-        self.provider_status_text.set(self.live.provider_badge())
-        self.log_console(f"Priority: {', '.join(analysis['priority_nodes'])} | {action}")
-
-    def _update_route_summary(self, path_edges, route_cost):
-        if path_edges:
-            for u, v in path_edges:
-                self.axN.add_patch(FancyArrowPatch(self.pos[u], self.pos[v], color="#00ffcc", linewidth=2.8, alpha=0.8, arrowstyle="-"))
-
-            eta_local = (route_cost / 60.0) if route_cost else 0
-            eta_google = self.live.google_eta_s / 60.0 if self.live.google_eta_s else None
-            overlay = f" | Google ETA: {eta_google:.1f}m" if eta_google else ""
-            self.route_text.set(f"Route edges: {len(path_edges)} | Dijkstra ETA: {eta_local:.1f}m{overlay}")
-            self.travel_overlay_text.set(f"ETA Overlay: Dijkstra {eta_local:.1f}m" + (f" vs Google {eta_google:.1f}m" if eta_google else ""))
-            self.last_eta_local = eta_local
-            self.last_eta_google = eta_google
-            self.eta_gap_text.set(f"ETA Gap: {eta_google - eta_local:+.1f}m" if eta_google is not None else "ETA Gap: N/A")
-            self._set_status_text("STATUS: ROUTE ACTIVE", "#00ffcc")
-            return
-
-        self.route_text.set("⛔ NO ROUTE AVAILABLE")
-        self._set_status_text("STATUS: ALERT", "#ff0000")
-
     def _panel_traffic_display(self):
         self.frame_graph = tk.Frame(self.pan_btm, bg="#000000")
         self.frame_graph.pack(side="left", fill="both", expand=True)
@@ -414,7 +353,26 @@ class Dashboard:
         nx.draw_networkx_nodes(self.router.G, self.pos, ax=self.axN, node_size=90, node_color=colors, edgecolors="white", linewidths=0.3)
 
         path_edges, route_cost = self.router.route(self.start_node.get(), self.end_node.get())
-        self._update_route_summary(path_edges, route_cost)
+        if path_edges:
+            for u, v in path_edges:
+                self.axN.add_patch(FancyArrowPatch(self.pos[u], self.pos[v], color="#00ffcc", linewidth=2.8, alpha=0.8, arrowstyle="-"))
+
+            eta_local = (route_cost / 60.0) if route_cost else 0
+            eta_google = self.live.google_eta_s / 60.0 if self.live.google_eta_s else None
+            overlay = f" | Google ETA: {eta_google:.1f}m" if eta_google else ""
+            self.route_text.set(f"Route edges: {len(path_edges)} | Dijkstra ETA: {eta_local:.1f}m{overlay}")
+            self.travel_overlay_text.set(f"ETA Overlay: Dijkstra {eta_local:.1f}m" + (f" vs Google {eta_google:.1f}m" if eta_google else ""))
+            self.last_eta_local = eta_local
+            self.last_eta_google = eta_google
+            if eta_google is not None:
+                gap = eta_google - eta_local
+                self.eta_gap_text.set(f"ETA Gap: {gap:+.1f}m")
+            else:
+                self.eta_gap_text.set("ETA Gap: N/A")
+            self.lbl_status.config(text="STATUS: ROUTE ACTIVE", fg="#00ffcc")
+        else:
+            self.route_text.set("⛔ NO ROUTE AVAILABLE")
+            self.lbl_status.config(text="STATUS: ALERT", fg="#ff0000")
 
     def tick(self):
         origin_xy, dest_xy = self._origin_dest_xy()
@@ -446,12 +404,51 @@ class Dashboard:
         self.lbl_ai_state.config(fg=color_map.get(self.ai.status, "white"))
 
         now = time.time()
-        self._update_edge_buttons(active_blocks, now)
-        self._render_prediction_panel(self.end_node.get(), analysis)
-        self._update_metric_labels(analysis, action)
+        for key, btn in self.edge_buttons.items():
+            if key in active_blocks:
+                remaining = int(active_blocks[key] - now)
+                btn.config(bg="#aa0000", text=f"⛔ {key[0]}-{key[1]} ({remaining}s)")
+            else:
+                btn.config(bg="#333333", fg="white", text=f"{key[0]} ↔ {key[1]}")
+
+        target = self.end_node.get()
+        hist_y = list(self.sim.hist[target])
+        pred = self.nn.predict(target)
+        for collection in self.axF.collections[:]:
+            collection.remove()
+
+        if pred[0] is not None:
+            _, std_dev, horizon, conf = pred
+            x_hist = range(len(hist_y))
+            x_pred = range(len(hist_y), len(hist_y) + len(horizon))
+            self.pred_hist_line.set_data(x_hist, hist_y)
+            self.pred_horizon_line.set_data(x_pred, horizon)
+            self.real_line.set_data(x_hist, list(self.sim.hist_real[target]))
+            self.sim_line.set_data(x_hist, list(self.sim.hist_sim[target]))
+            self.axF.fill_between(x_pred, np.array(horizon) - 2 * std_dev, np.array(horizon) + 2 * std_dev, color="#00ffff", alpha=0.2)
+            self.last_conf = conf
+            self.confidence_text.set(f"Confidence: {conf*100:.1f}%")
+            if np.mean(horizon[:4]) > 680:
+                warning = f"Predictive congestion warning at {target}."
+                self.ai.log("PREDICT", warning)
+                self.voice.speak(warning)
+        else:
+            self.confidence_text.set("Confidence: warming up model")
+
+        self.axF.set_xlim(max(0, len(hist_y) - 60), len(hist_y) + PRED_HORIZON)
+        self.axF.set_ylim(0, 1000)
+
+        self.last_trend = analysis["trend"]
+        self.trend_text.set(f"Trend: {analysis['trend']}")
+        self.eff_text.set(f"Route Efficiency: {analysis['efficiency_delta']*100:+.1f}%")
+        self.health_text.set("Sensors: degraded" if analysis["health_issues"] else "Sensors: healthy")
+        self.data_source_text.set(self.live.live_badge())
+        self.provider_status_text.set(self.live.provider_badge())
 
         if analysis["anomalies"]:
             self.voice.speak("Incident detected. Autonomous control evaluating response.")
+
+        self.log_console(f"Priority: {', '.join(analysis['priority_nodes'])} | {action}")
 
         self.clock.config(text=datetime.now().strftime("%H:%M:%S"))
         self.draw_network()

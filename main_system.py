@@ -7,7 +7,6 @@ from datetime import datetime
 
 import networkx as nx
 import numpy as np
-import requests
 import torch
 import torch.nn as nn
 
@@ -17,10 +16,6 @@ ROAD_SPECS = {
     "local": {"speed": 30, "lanes": 1, "class_weight": 1.3},
     "ring": {"speed": 48, "lanes": 2, "class_weight": 0.95},
 }
-HISTORY_LENGTH = 120
-DEFAULT_VOLUME = 200.0
-MAX_VOLUME = 890
-SENSOR_DROPOUT_PROBABILITY = 0.015
 
 
 @dataclass
@@ -253,25 +248,11 @@ class TrafficSim:
         self.health = {n: SensorHealth() for n in self.nodes}
         self.last_context = "Clear"
 
-    def _build_history_buffers(self):
-        return {node: deque([DEFAULT_VOLUME] * HISTORY_LENGTH, maxlen=HISTORY_LENGTH) for node in self.nodes}
-
     def calibrate_from_historical(self, traffic_integrator: LiveTrafficIntegrator):
         if traffic_integrator.tomtom_key:
             self.cfg.morning_peak = (7, 11)
             self.cfg.evening_peak = (16, 21)
             self.cfg.weekend_drop = 0.78
-
-    def _update_sensor_health(self, node: str, effective_volume: float):
-        health = self.health[node]
-        if random.random() < SENSOR_DROPOUT_PROBABILITY:
-            effective_volume = self.ema[node]
-            health.dropouts += 1
-            health.quality = max(0.2, health.quality - 0.08)
-        else:
-            health.quality = min(1.0, health.quality + 0.01)
-        health.degraded = health.quality < 0.55
-        return effective_volume
 
     def _hour_multiplier(self, now: datetime) -> float:
         hour = now.hour + now.minute / 60.0
@@ -309,9 +290,17 @@ class TrafficSim:
             base = 220 + 40 * np.sin(t / 60)
             wave = 120 * np.sin(t / 10 + self.phase[index])
             noise = np.random.normal(0, 15)
-            simulated_volume = np.clip((base + wave + noise) * demand_multiplier * weather_factor * event_factor, 30, MAX_VOLUME)
+            simulated_volume = np.clip((base + wave + noise) * demand_multiplier * weather_factor * event_factor, 30, 890)
             effective_volume = simulated_volume * speed_factor
-            effective_volume = self._update_sensor_health(node, effective_volume)
+
+            health = self.health[node]
+            if random.random() < 0.015:
+                effective_volume = self.ema[node]
+                health.dropouts += 1
+                health.quality = max(0.2, health.quality - 0.08)
+            else:
+                health.quality = min(1.0, health.quality + 0.01)
+            health.degraded = health.quality < 0.55
 
             self.ema[node] = 0.2 * effective_volume + 0.8 * self.ema[node]
             smoothed_volume = float(self.ema[node])
@@ -324,14 +313,21 @@ class TrafficSim:
 
 
 class Router:
-    def __init__(self, city="SimCity Grid", grid_w=8, grid_h=6, spacing_km=0.7):
+    def __init__(self, city="SimCity Grid", grid_w=8, grid_h=6, spacing_km=0.7, use_real_city=False, city_name="San Francisco"):
         self.city = city
         self.grid_w = grid_w
         self.grid_h = grid_h
         self.spacing_km = spacing_km
+        self.use_real_city = use_real_city
+        self.city_name = city_name
         self.G = nx.Graph()
         self.blocked_edges = {}
-        self._build_simulated_city()
+
+        if use_real_city:
+            self._build_real_city_network()
+        else:
+            self._build_simulated_city()
+
         self.nodes = list(self.G.nodes())
 
     def _node_name(self, x, y):
@@ -405,24 +401,121 @@ class Router:
             self._add_road(self._node_name(0, y), self._node_name(0, y + 1), self.spacing_km * 1.15, "ring")
             self._add_road(self._node_name(self.grid_w - 1, y), self._node_name(self.grid_w - 1, y + 1), self.spacing_km * 1.15, "ring")
 
+    def _build_real_city_network(self):
+        """Build a network based on real city layout or simulated realistic city"""
+        city_configs = {
+            "San Francisco": {
+                "center": (-122.4194, 37.7749),
+                "landmarks": [
+                    ("Downtown", -122.4194, 37.7749),
+                    ("Mission", -122.4194, 37.7599),
+                    ("SOMA", -122.3928, 37.7749),
+                    ("Marina", -122.4378, 37.8024),
+                    ("Castro", -122.4350, 37.7609),
+                    ("Haight", -122.4469, 37.7694),
+                    ("Richmond", -122.4688, 37.7800),
+                    ("Sunset", -122.4625, 37.7550),
+                    ("Financial", -122.3988, 37.7941),
+                    ("Embarcadero", -122.3933, 37.7955),
+                    ("North Beach", -122.4100, 37.8005),
+                    ("Chinatown", -122.4058, 37.7941),
+                    ("Potrero", -122.4025, 37.7599),
+                    ("Nob Hill", -122.4161, 37.7928),
+                    ("Pac Heights", -122.4375, 37.7925),
+                ],
+            },
+            "New York": {
+                "center": (-74.0060, 40.7128),
+                "landmarks": [
+                    ("Midtown", -73.9857, 40.7549),
+                    ("Times Square", -73.9855, 40.7580),
+                    ("Wall Street", -74.0088, 40.7074),
+                    ("Central Park", -73.9654, 40.7829),
+                    ("SoHo", -74.0014, 40.7233),
+                    ("Chelsea", -74.0014, 40.7465),
+                    ("Greenwich", -74.0027, 40.7336),
+                    ("Tribeca", -74.0099, 40.7195),
+                    ("East Village", -73.9865, 40.7265),
+                    ("Upper East", -73.9626, 40.7736),
+                    ("Upper West", -73.9755, 40.7870),
+                    ("Harlem", -73.9496, 40.8116),
+                    ("Brooklyn Heights", -73.9926, 40.6942),
+                    ("Williamsburg", -73.9532, 40.7081),
+                    ("Queens Plaza", -73.9375, 40.7489),
+                ],
+            },
+            "London": {
+                "center": (-0.1276, 51.5074),
+                "landmarks": [
+                    ("Westminster", -0.1276, 51.4994),
+                    ("City", -0.0877, 51.5155),
+                    ("Camden", -0.1426, 51.5390),
+                    ("Shoreditch", -0.0807, 51.5245),
+                    ("Kensington", -0.1932, 51.4990),
+                    ("Chelsea", -0.1687, 51.4875),
+                    ("Soho", -0.1318, 51.5136),
+                    ("Canary Wharf", -0.0235, 51.5054),
+                    ("Notting Hill", -0.2058, 51.5099),
+                    ("Hackney", -0.0553, 51.5450),
+                    ("Islington", -0.1028, 51.5465),
+                    ("Tower Bridge", -0.0754, 51.5055),
+                    ("Covent Garden", -0.1243, 51.5117),
+                    ("Mayfair", -0.1451, 51.5095),
+                    ("Southwark", -0.0955, 51.5010),
+                ],
+            },
+        }
+
+        config = city_configs.get(self.city_name, city_configs["San Francisco"])
+        landmarks = config["landmarks"]
+
+        for name, lon, lat in landmarks:
+            self.G.add_node(name, x=lon, y=lat, zone="URBAN")
+
+        for i, (name1, lon1, lat1) in enumerate(landmarks):
+            for name2, lon2, lat2 in landmarks[i + 1:]:
+                distance = self._haversine_distance(lat1, lon1, lat2, lon2)
+
+                if distance < 3.5:
+                    if distance < 1.2:
+                        road_type = "arterial"
+                    elif distance < 2.0:
+                        road_type = "collector"
+                    else:
+                        road_type = "local"
+
+                    self._add_road(name1, name2, distance, road_type)
+
+        for i, (name1, _, _) in enumerate(landmarks):
+            closest_nodes = []
+            for j, (name2, lon2, lat2) in enumerate(landmarks):
+                if i != j:
+                    lon1, lat1 = landmarks[i][1], landmarks[i][2]
+                    dist = self._haversine_distance(lat1, lon1, lat2, lon2)
+                    closest_nodes.append((dist, name2))
+
+            closest_nodes.sort()
+            for dist, name2 in closest_nodes[:4]:
+                if not self.G.has_edge(name1, name2) and dist < 5.0:
+                    road_type = "collector" if dist < 2.5 else "local"
+                    self._add_road(name1, name2, dist, road_type)
+
+    def _haversine_distance(self, lat1, lon1, lat2, lon2):
+        """Calculate distance between two points in km"""
+        R = 6371
+        lat1_rad, lon1_rad = np.radians(lat1), np.radians(lon1)
+        lat2_rad, lon2_rad = np.radians(lat2), np.radians(lon2)
+
+        dlat = lat2_rad - lat1_rad
+        dlon = lon2_rad - lon1_rad
+
+        a = np.sin(dlat / 2)**2 + np.cos(lat1_rad) * np.cos(lat2_rad) * np.sin(dlon / 2)**2
+        c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+
+        return R * c
+
     def block_edge(self, u, v, duration=30):
         self.blocked_edges[self.normalize_edge(u, v)] = time.time() + duration
-
-    def block_incident_near(self, lat: float, lon: float, duration=45):
-        nearest = None
-        nearest_distance = 1e9
-        for u, v in self.G.edges():
-            ux, uy = self.G.nodes[u]["x"], self.G.nodes[u]["y"]
-            vx, vy = self.G.nodes[v]["x"], self.G.nodes[v]["y"]
-            cx, cy = (ux + vx) / 2.0, (uy + vy) / 2.0
-            distance = (cx - lon) ** 2 + (cy - lat) ** 2
-            if distance < nearest_distance:
-                nearest_distance = distance
-                nearest = (u, v)
-        if nearest:
-            self.block_edge(nearest[0], nearest[1], duration)
-            return nearest
-        return None
 
     def check_blocks(self):
         now = time.time()
