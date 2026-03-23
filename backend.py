@@ -1,10 +1,5 @@
 import asyncio
-import json
-import os
-import threading
-import time
 from datetime import datetime
-from typing import Dict, List, Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,7 +18,7 @@ app.add_middleware(
 )
 
 router = Router()
-nodes = list(router.G.nodes())
+nodes = router.nodes
 sim = TrafficSim(nodes)
 nn = NeuralPredictor()
 ai = AIDecisionEngine(sim, router)
@@ -49,9 +44,43 @@ class AIToggle(BaseModel):
     enabled: bool
 
 
+def serialize_blocked_edges(include_expiry: bool = False):
+    blocked_edges = []
+    for (u, v), expiry in router.blocked_edges.items():
+        edge = {"u": u, "v": v}
+        if include_expiry:
+            edge["expiry"] = expiry
+        blocked_edges.append(edge)
+    return blocked_edges
+
+
+def build_route_payload(path_edges, route_cost):
+    return {
+        "edges": [[u, v] for u, v in path_edges] if path_edges else [],
+        "cost": route_cost,
+        "eta_minutes": (route_cost / 60.0) if route_cost else 0,
+    }
+
+
+def serialize_node_positions():
+    return {
+        node: {
+            "x": router.G.nodes[node].get("x"),
+            "y": router.G.nodes[node].get("y"),
+        }
+        for node in nodes
+    }
+
+
 @app.get("/api/nodes")
 async def get_nodes():
-    return {"nodes": nodes}
+    return {
+        "nodes": nodes,
+        "positions": serialize_node_positions(),
+        "city": router.city,
+        "city_source": router.city_source,
+        "city_center": router.city_center,
+    }
 
 
 @app.get("/api/edges")
@@ -71,11 +100,10 @@ async def get_edges():
 
 @app.get("/api/traffic")
 async def get_traffic():
-    global vols
     return {
         "volumes": vols,
         "timestamp": datetime.now().isoformat(),
-        "blocked_edges": [{"u": u, "v": v, "expiry": exp} for (u, v), exp in router.blocked_edges.items()],
+        "blocked_edges": serialize_blocked_edges(include_expiry=True),
     }
 
 
@@ -85,27 +113,25 @@ async def calculate_route(request: RouteRequest):
     current_route = {"start": request.start, "end": request.end}
 
     path_edges, route_cost = router.route(request.start, request.end)
-
     if not path_edges:
         return {"success": False, "message": "No route available"}
 
-    eta_min = (route_cost / 60.0) if route_cost else 0
-
+    route = build_route_payload(path_edges, route_cost)
     return {
         "success": True,
-        "path": [e for e in path_edges],
-        "cost": route_cost,
-        "eta_minutes": eta_min,
+        "path": route["edges"],
+        "cost": route["cost"],
+        "eta_minutes": route["eta_minutes"],
         "edges_count": len(path_edges),
     }
 
 
 @app.post("/api/block")
 async def block_edge(request: BlockRequest):
-    key = tuple(sorted((request.node1, request.node2)))
-    router.block_edge(key[0], key[1], request.duration)
-    ai.log("API", f"Edge {key[0]}-{key[1]} blocked for {request.duration}s")
-    return {"success": True, "message": f"Blocked {key[0]}-{key[1]} for {request.duration}s"}
+    blocked_u, blocked_v = router.normalize_edge(request.node1, request.node2)
+    router.block_edge(blocked_u, blocked_v, request.duration)
+    ai.log("API", f"Edge {blocked_u}-{blocked_v} blocked for {request.duration}s")
+    return {"success": True, "message": f"Blocked {blocked_u}-{blocked_v} for {request.duration}s"}
 
 
 @app.post("/api/ai/toggle")
@@ -155,38 +181,34 @@ async def get_live_status():
         "last_latency_ms": live.last_latency_ms,
         "incident_count": len(live.incident_points),
         "social_incidents": len(live.social_incidents),
+        "external_eta_s": live.external_eta_s,
     }
 
 
 @app.websocket("/ws/traffic")
 async def websocket_endpoint(websocket: WebSocket):
+    global vols
+
     await websocket.accept()
 
     try:
         while True:
-            global vols
-
-            vols, sim_only = sim.step(live.speed_factor if live.live_mode else 1.0)
+            vols, _ = sim.step(live.speed_factor if live.live_mode else 1.0)
             router.check_blocks()
             router.update(vols)
 
-            for n, v in vols.items():
-                nn.update(n, v)
+            for node, volume in vols.items():
+                nn.update(node, volume)
 
             analysis = ai.analyze(vols, current_route["start"], current_route["end"])
             action = ai.maybe_act(analysis)
-
             path_edges, route_cost = router.route(current_route["start"], current_route["end"])
 
-            data = {
+            await websocket.send_json({
                 "volumes": vols,
                 "timestamp": datetime.now().isoformat(),
-                "blocked_edges": [{"u": u, "v": v} for u, v in router.blocked_edges.keys()],
-                "route": {
-                    "edges": [[u, v] for u, v in path_edges] if path_edges else [],
-                    "cost": route_cost,
-                    "eta_minutes": (route_cost / 60.0) if route_cost else 0,
-                },
+                "blocked_edges": serialize_blocked_edges(),
+                "route": build_route_payload(path_edges, route_cost),
                 "ai": {
                     "status": ai.status,
                     "action": action,
@@ -198,15 +220,18 @@ async def websocket_endpoint(websocket: WebSocket):
                     node: {"quality": sim.health[node].quality, "degraded": sim.health[node].degraded}
                     for node in nodes[:10]
                 },
-            }
-
-            await websocket.send_json(data)
+                "city": {
+                    "name": router.city,
+                    "source": router.city_source,
+                    "center": router.city_center,
+                },
+            })
             await asyncio.sleep(1)
-
     except WebSocketDisconnect:
         pass
 
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000)

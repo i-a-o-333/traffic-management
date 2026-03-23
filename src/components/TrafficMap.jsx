@@ -1,7 +1,66 @@
 import { useEffect, useRef } from 'react';
 import './TrafficMap.css';
 
-function TrafficMap({ trafficData, nodes, edges, onBlockEdge }) {
+const MAP_PADDING = 60;
+const MAX_TRAFFIC_VOLUME = 900;
+
+function buildGridNodePositions(width, height, nodes) {
+  const nodePositions = {};
+  const gridWidth = Math.max(2, Math.ceil(Math.sqrt(nodes.length)));
+  const gridHeight = Math.max(2, Math.ceil(nodes.length / gridWidth));
+  const cellWidth = (width - MAP_PADDING * 2) / (gridWidth - 1);
+  const cellHeight = (height - MAP_PADDING * 2) / (gridHeight - 1);
+
+  nodes.forEach((nodeName, index) => {
+    const x = index % gridWidth;
+    const y = Math.floor(index / gridWidth);
+    nodePositions[nodeName] = {
+      x: MAP_PADDING + x * cellWidth,
+      y: MAP_PADDING + y * cellHeight,
+    };
+  });
+
+  return nodePositions;
+}
+
+function buildGeoNodePositions(width, height, positions) {
+  const nodePositions = {};
+  const values = Object.values(positions).filter(({ x, y }) => x !== undefined && y !== undefined);
+  if (!values.length) {
+    return {};
+  }
+
+  const minX = Math.min(...values.map(({ x }) => x));
+  const maxX = Math.max(...values.map(({ x }) => x));
+  const minY = Math.min(...values.map(({ y }) => y));
+  const maxY = Math.max(...values.map(({ y }) => y));
+  const scaleX = maxX - minX || 1;
+  const scaleY = maxY - minY || 1;
+
+  Object.entries(positions).forEach(([nodeName, point]) => {
+    if (point.x === undefined || point.y === undefined) return;
+    nodePositions[nodeName] = {
+      x: MAP_PADDING + ((point.x - minX) / scaleX) * (width - MAP_PADDING * 2),
+      y: MAP_PADDING + (1 - (point.y - minY) / scaleY) * (height - MAP_PADDING * 2),
+    };
+  });
+
+  return nodePositions;
+}
+
+function createBlockedEdgeSet(blockedEdges = []) {
+  return new Set(blockedEdges.flatMap(({ u, v }) => [`${u}-${v}`, `${v}-${u}`]));
+}
+
+function getNodeColor(volume) {
+  const normalizedVolume = Math.min(volume / MAX_TRAFFIC_VOLUME, 1);
+  const red = Math.round(normalizedVolume * 239 + (1 - normalizedVolume) * 34);
+  const green = Math.round((1 - normalizedVolume) * 211 + normalizedVolume * 68);
+  const blue = Math.round((1 - normalizedVolume) * 234 + normalizedVolume * 64);
+  return `rgb(${red}, ${green}, ${blue})`;
+}
+
+function TrafficMap({ trafficData, nodes, edges, positions }) {
   const canvasRef = useRef(null);
   const containerRef = useRef(null);
 
@@ -18,34 +77,17 @@ function TrafficMap({ trafficData, nodes, edges, onBlockEdge }) {
 
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    const nodePositions = {};
-    const gridW = 8;
-    const gridH = 6;
-    const padding = 60;
-    const cellWidth = (canvas.width - padding * 2) / (gridW - 1);
-    const cellHeight = (canvas.height - padding * 2) / (gridH - 1);
+    const nodePositions = Object.keys(positions || {}).length
+      ? buildGeoNodePositions(canvas.width, canvas.height, positions)
+      : buildGridNodePositions(canvas.width, canvas.height, nodes);
+    const blockedSet = createBlockedEdgeSet(trafficData.blocked_edges);
 
-    for (let y = 0; y < gridH; y++) {
-      for (let x = 0; x < gridW; x++) {
-        const nodeName = `N${x}_${y}`;
-        nodePositions[nodeName] = {
-          x: padding + x * cellWidth,
-          y: padding + y * cellHeight,
-        };
-      }
-    }
-
-    const blockedSet = new Set(
-      trafficData.blocked_edges?.map(e => `${e.u}-${e.v}`) || []
-    );
-
-    edges.forEach(edge => {
+    edges.forEach((edge) => {
       const start = nodePositions[edge.source];
       const end = nodePositions[edge.target];
       if (!start || !end) return;
 
-      const isBlocked = blockedSet.has(`${edge.source}-${edge.target}`) ||
-                       blockedSet.has(`${edge.target}-${edge.source}`);
+      const isBlocked = blockedSet.has(`${edge.source}-${edge.target}`);
 
       ctx.beginPath();
       ctx.moveTo(start.x, start.y);
@@ -55,8 +97,7 @@ function TrafficMap({ trafficData, nodes, edges, onBlockEdge }) {
       ctx.stroke();
     });
 
-    const routeEdges = trafficData.route?.edges || [];
-    routeEdges.forEach(([source, target]) => {
+    (trafficData.route?.edges || []).forEach(([source, target]) => {
       const start = nodePositions[source];
       const end = nodePositions[target];
       if (!start || !end) return;
@@ -83,20 +124,15 @@ function TrafficMap({ trafficData, nodes, edges, onBlockEdge }) {
       ctx.restore();
     });
 
-    nodes.forEach(node => {
+    nodes.forEach((node) => {
       const pos = nodePositions[node];
       if (!pos) return;
 
       const volume = trafficData.volumes?.[node] || 0;
-      const normalizedVolume = Math.min(volume / 900, 1);
-
-      const red = Math.round(normalizedVolume * 239 + (1 - normalizedVolume) * 34);
-      const green = Math.round((1 - normalizedVolume) * 211 + normalizedVolume * 68);
-      const blue = Math.round((1 - normalizedVolume) * 234 + normalizedVolume * 64);
 
       ctx.beginPath();
       ctx.arc(pos.x, pos.y, 8, 0, 2 * Math.PI);
-      ctx.fillStyle = `rgb(${red}, ${green}, ${blue})`;
+      ctx.fillStyle = getNodeColor(volume);
       ctx.fill();
       ctx.strokeStyle = 'white';
       ctx.lineWidth = 2;
@@ -107,7 +143,6 @@ function TrafficMap({ trafficData, nodes, edges, onBlockEdge }) {
       ctx.textAlign = 'center';
       ctx.fillText(node, pos.x, pos.y - 15);
     });
-
   }, [trafficData, nodes, edges]);
 
   return (

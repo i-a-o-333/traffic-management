@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import TrafficMap from './components/TrafficMap';
 import ControlPanel from './components/ControlPanel';
 import MetricsPanel from './components/MetricsPanel';
@@ -6,55 +6,74 @@ import AIAssistant from './components/AIAssistant';
 import LiveChart from './components/LiveChart';
 import './App.css';
 
+async function fetchJson(url, options) {
+  const response = await fetch(url, options);
+  return response.json();
+}
+
 function App() {
   const [trafficData, setTrafficData] = useState(null);
   const [nodes, setNodes] = useState([]);
   const [edges, setEdges] = useState([]);
+  const [positions, setPositions] = useState({});
+  const [cityInfo, setCityInfo] = useState(null);
   const [selectedOrigin, setSelectedOrigin] = useState('');
   const [selectedDest, setSelectedDest] = useState('');
   const [aiEnabled, setAiEnabled] = useState(true);
   const [isConnected, setIsConnected] = useState(false);
   const wsRef = useRef(null);
+  const reconnectTimeoutRef = useRef(null);
 
   useEffect(() => {
-    fetch('/api/nodes')
-      .then(res => res.json())
-      .then(data => {
-        setNodes(data.nodes);
-        if (data.nodes.length > 0) {
-          setSelectedOrigin(data.nodes[0]);
-          setSelectedDest(data.nodes[Math.min(4, data.nodes.length - 1)]);
-        }
+    async function loadInitialData() {
+      const [nodesData, edgesData] = await Promise.all([
+        fetchJson('/api/nodes'),
+        fetchJson('/api/edges'),
+      ]);
+
+      setNodes(nodesData.nodes);
+      setEdges(edgesData.edges);
+      setPositions(nodesData.positions || {});
+      setCityInfo({
+        name: nodesData.city,
+        source: nodesData.city_source,
       });
 
-    fetch('/api/edges')
-      .then(res => res.json())
-      .then(data => setEdges(data.edges));
+      if (nodesData.nodes.length > 0) {
+        setSelectedOrigin(nodesData.nodes[0]);
+        setSelectedDest(nodesData.nodes[Math.min(4, nodesData.nodes.length - 1)]);
+      }
+    }
+
+    loadInitialData();
   }, []);
 
   useEffect(() => {
+    let active = true;
+
     const connectWebSocket = () => {
-      const ws = new WebSocket(`ws://${window.location.hostname}:8000/ws/traffic`);
+      const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+      const ws = new WebSocket(`${protocol}://${window.location.hostname}:8000/ws/traffic`);
 
       ws.onopen = () => {
-        console.log('WebSocket connected');
+        if (!active) return;
         setIsConnected(true);
       };
 
       ws.onmessage = (event) => {
-        const data = JSON.parse(event.data);
-        setTrafficData(data);
+        if (!active) return;
+        setTrafficData(JSON.parse(event.data));
       };
 
-      ws.onerror = (error) => {
-        console.error('WebSocket error:', error);
+      ws.onerror = () => {
+        if (!active) return;
         setIsConnected(false);
       };
 
       ws.onclose = () => {
-        console.log('WebSocket disconnected');
+        if (!active) return;
         setIsConnected(false);
-        setTimeout(connectWebSocket, 3000);
+        reconnectTimeoutRef.current = setTimeout(connectWebSocket, 3000);
       };
 
       wsRef.current = ws;
@@ -63,6 +82,10 @@ function App() {
     connectWebSocket();
 
     return () => {
+      active = false;
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+      }
       if (wsRef.current) {
         wsRef.current.close();
       }
@@ -70,26 +93,16 @@ function App() {
   }, []);
 
   const handleRouteChange = async () => {
-    const response = await fetch('/api/route', {
+    await fetchJson('/api/route', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ start: selectedOrigin, end: selectedDest }),
-    });
-    const result = await response.json();
-    console.log('Route calculated:', result);
-  };
-
-  const handleBlockEdge = async (node1, node2, duration = 30) => {
-    await fetch('/api/block', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ node1, node2, duration }),
     });
   };
 
   const toggleAI = async () => {
     const newState = !aiEnabled;
-    await fetch('/api/ai/toggle', {
+    await fetchJson('/api/ai/toggle', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ enabled: newState }),
@@ -102,6 +115,7 @@ function App() {
       <header className="header">
         <div className="header-content">
           <h1 className="title">Traffic Control System</h1>
+          {cityInfo && <span>{cityInfo.name} · {cityInfo.source}</span>}
           <div className="connection-status">
             <div className={`status-indicator ${isConnected ? 'connected' : 'disconnected'}`}></div>
             <span>{isConnected ? 'Live' : 'Disconnected'}</span>
@@ -130,7 +144,7 @@ function App() {
               trafficData={trafficData}
               nodes={nodes}
               edges={edges}
-              onBlockEdge={handleBlockEdge}
+              positions={positions}
             />
           </div>
 

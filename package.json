@@ -1,5 +1,5 @@
 {
-  "name": "traffic-control-ui",
+  "name": "traffic-management-command-center",
   "private": true,
   "version": "1.0.0",
   "type": "module",
@@ -18,5 +18,6 @@
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.1",
     "vite": "^5.4.2"
-  }
+  },
+  "description": "AI-assisted traffic management dashboard with FastAPI, React, and simulation tooling."
 }
