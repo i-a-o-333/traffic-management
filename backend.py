@@ -68,7 +68,13 @@ def build_route_payload(path_edges, route_cost):
 
 @app.get("/api/nodes")
 async def get_nodes():
-    return {"nodes": nodes}
+    return {
+        "nodes": nodes,
+        "positions": serialize_node_positions(),
+        "city": router.city,
+        "city_source": router.city_source,
+        "city_center": router.city_center,
+    }
 
 
 @app.get("/api/edges")
@@ -169,6 +175,7 @@ async def get_live_status():
         "last_latency_ms": live.last_latency_ms,
         "incident_count": len(live.incident_points),
         "social_incidents": len(live.social_incidents),
+        "external_eta_s": live.external_eta_s,
     }
 
 

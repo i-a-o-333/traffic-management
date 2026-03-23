@@ -97,6 +97,7 @@ class LiveTrafficIntegrator:
         self.google_key = os.getenv("GOOGLE_MAPS_API_KEY")
         self.x_bearer = os.getenv("X_BEARER_TOKEN")
 
+    def __init__(self):
         self.last_poll = 0.0
         self.next_poll_s = 35
         self.last_success = 0.0
@@ -106,8 +107,8 @@ class LiveTrafficIntegrator:
         self.speed_factor = 1.0
         self.incident_points: list[tuple[float, float]] = []
         self.social_incidents: list[str] = []
-        self.google_eta_s = None
-        self.provider_status = {"TomTom": "idle", "HERE": "idle", "X": "idle", "Google": "idle"}
+        self.external_eta_s = None
+        self.provider_status = {"OpenStreetMap": "idle", "Open-Meteo": "idle", "OSRM": "idle"}
         self.last_latency_ms = 0
 
     def should_poll(self):
@@ -353,6 +354,111 @@ class Router:
             lanes=lanes,
             speed_kmh=speed,
         )
+
+    def _build_city(self):
+        try:
+            self._build_real_city()
+            self.city_source = "openstreetmap"
+        except Exception:
+            self.G.clear()
+            self._build_simulated_city()
+            self.city = "SimCity Grid"
+            self.city_source = "simulated"
+
+    def _build_real_city(self):
+        location = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": self.city, "format": "jsonv2", "limit": 1},
+            headers={"User-Agent": "traffic-management-demo/1.0"},
+            timeout=15,
+        )
+        location.raise_for_status()
+        places = location.json()
+        if not places:
+            raise RuntimeError("City lookup failed")
+
+        city_data = places[0]
+        lat = float(city_data["lat"])
+        lon = float(city_data["lon"])
+        self.city_center = {"lat": lat, "lon": lon, "display_name": city_data.get("display_name", self.city)}
+
+        overpass_query = f"""
+        [out:json][timeout:25];
+        (
+          way(around:{DEFAULT_CITY_RADIUS_METERS},{lat},{lon})[highway];
+        );
+        (._;>;);
+        out body;
+        """
+        response = requests.get(
+            "https://overpass-api.de/api/interpreter",
+            params={"data": overpass_query},
+            headers={"User-Agent": "traffic-management-demo/1.0"},
+            timeout=30,
+        )
+        response.raise_for_status()
+        elements = response.json().get("elements", [])
+        if not elements:
+            raise RuntimeError("Road network lookup failed")
+
+        node_lookup = {
+            element["id"]: element
+            for element in elements
+            if element.get("type") == "node"
+        }
+        road_type_aliases = {
+            "motorway": "ring",
+            "trunk": "arterial",
+            "primary": "arterial",
+            "secondary": "collector",
+            "tertiary": "collector",
+            "residential": "local",
+            "service": "local",
+        }
+
+        for way in elements:
+            if way.get("type") != "way":
+                continue
+            node_ids = way.get("nodes", [])
+            if len(node_ids) < 2:
+                continue
+
+            road_type = road_type_aliases.get(way.get("tags", {}).get("highway"), "local")
+            for start_id, end_id in zip(node_ids, node_ids[1:]):
+                start = node_lookup.get(start_id)
+                end = node_lookup.get(end_id)
+                if not start or not end:
+                    continue
+
+                start_name = f"R{start_id}"
+                end_name = f"R{end_id}"
+                self.G.add_node(start_name, x=float(start["lon"]), y=float(start["lat"]))
+                self.G.add_node(end_name, x=float(end["lon"]), y=float(end["lat"]))
+                self._add_road(
+                    start_name,
+                    end_name,
+                    self._distance_km(float(start["lat"]), float(start["lon"]), float(end["lat"]), float(end["lon"])),
+                    road_type,
+                )
+
+        if self.G.number_of_nodes() == 0:
+            raise RuntimeError("No roads could be constructed")
+
+        largest_component = max(nx.connected_components(self.G), key=len)
+        self.G = self.G.subgraph(largest_component).copy()
+        if self.G.number_of_nodes() > MAX_CITY_NODES:
+            ranked_nodes = sorted(self.G.degree, key=lambda item: item[1], reverse=True)[:MAX_CITY_NODES]
+            keep_nodes = {node for node, _ in ranked_nodes}
+            self.G = self.G.subgraph(keep_nodes).copy()
+            largest_component = max(nx.connected_components(self.G), key=len)
+            self.G = self.G.subgraph(largest_component).copy()
+
+    def _distance_km(self, lat1, lon1, lat2, lon2):
+        lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
+        return 6371.0 * (2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a)))
 
     def _build_simulated_city(self):
         base_lon, base_lat = 77.56, 12.93

@@ -15,6 +15,8 @@ function App() {
   const [trafficData, setTrafficData] = useState(null);
   const [nodes, setNodes] = useState([]);
   const [edges, setEdges] = useState([]);
+  const [positions, setPositions] = useState({});
+  const [cityInfo, setCityInfo] = useState(null);
   const [selectedOrigin, setSelectedOrigin] = useState('');
   const [selectedDest, setSelectedDest] = useState('');
   const [aiEnabled, setAiEnabled] = useState(true);
