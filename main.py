@@ -12,6 +12,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.patches import FancyArrowPatch
 
 from main_system import AIDecisionEngine, LiveTrafficIntegrator, NeuralPredictor, Router, TrafficSim
+import os
 
 plt.style.use("dark_background")
 
@@ -19,6 +20,9 @@ MAX_VOL = 900
 UPDATE_MS = 1000
 BLOCK_DURATION = 30
 PRED_HORIZON = 12
+
+USE_REAL_CITY = os.getenv("USE_REAL_CITY", "false").lower() == "true"
+CITY_NAME = os.getenv("CITY_NAME", "San Francisco")
 
 
 class VoiceAlert:
@@ -52,11 +56,12 @@ class VoiceAlert:
 class Dashboard:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("AI TRAFFIC CONTROL • CENTRAL COMMAND")
+        city_title = f"AI TRAFFIC CONTROL • {CITY_NAME.upper() if USE_REAL_CITY else 'SIMULATED CITY'}"
+        self.root.title(city_title)
         self.root.geometry("1900x1000")
         self.root.configure(bg="#121212")
 
-        self.router = Router()
+        self.router = Router(use_real_city=USE_REAL_CITY, city_name=CITY_NAME)
         self.nodes = list(self.router.G.nodes())
         self.sim = TrafficSim(self.nodes)
         self.nn = NeuralPredictor()

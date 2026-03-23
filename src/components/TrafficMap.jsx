@@ -1,24 +1,99 @@
 import { useEffect, useRef } from 'react';
 import './TrafficMap.css';
 
-const GRID_WIDTH = 8;
-const GRID_HEIGHT = 6;
 const MAP_PADDING = 60;
 const MAX_TRAFFIC_VOLUME = 900;
 
-function buildNodePositions(width, height) {
+function buildNodePositions(width, height, edges, nodes) {
   const nodePositions = {};
-  const cellWidth = (width - MAP_PADDING * 2) / (GRID_WIDTH - 1);
-  const cellHeight = (height - MAP_PADDING * 2) / (GRID_HEIGHT - 1);
 
-  for (let y = 0; y < GRID_HEIGHT; y += 1) {
-    for (let x = 0; x < GRID_WIDTH; x += 1) {
-      const nodeName = `N${x}_${y}`;
-      nodePositions[nodeName] = {
-        x: MAP_PADDING + x * cellWidth,
-        y: MAP_PADDING + y * cellHeight,
-      };
+  if (nodes.length === 0) return nodePositions;
+
+  const firstEdge = edges[0];
+  const isGridFormat = firstEdge && firstEdge.source.startsWith('N') && firstEdge.source.includes('_');
+
+  if (isGridFormat) {
+    const gridNodes = {};
+    let maxX = 0, maxY = 0;
+
+    nodes.forEach(node => {
+      const match = node.match(/N(\d+)_(\d+)/);
+      if (match) {
+        const x = parseInt(match[1]);
+        const y = parseInt(match[2]);
+        gridNodes[node] = { gridX: x, gridY: y };
+        maxX = Math.max(maxX, x);
+        maxY = Math.max(maxY, y);
+      }
+    });
+
+    const cellWidth = (width - MAP_PADDING * 2) / maxX;
+    const cellHeight = (height - MAP_PADDING * 2) / maxY;
+
+    nodes.forEach(node => {
+      if (gridNodes[node]) {
+        nodePositions[node] = {
+          x: MAP_PADDING + gridNodes[node].gridX * cellWidth,
+          y: MAP_PADDING + gridNodes[node].gridY * cellHeight,
+        };
+      }
+    });
+  } else {
+    const positions = {};
+    nodes.forEach(node => {
+      positions[node] = { x: 0, y: 0 };
+    });
+
+    const graph = {};
+    nodes.forEach(node => { graph[node] = []; });
+    edges.forEach(edge => {
+      if (!graph[edge.source]) graph[edge.source] = [];
+      if (!graph[edge.target]) graph[edge.target] = [];
+      graph[edge.source].push(edge.target);
+      graph[edge.target].push(edge.source);
+    });
+
+    const visited = new Set();
+    const queue = [nodes[0]];
+    positions[nodes[0]] = { x: 0, y: 0 };
+    visited.add(nodes[0]);
+
+    while (queue.length > 0) {
+      const current = queue.shift();
+      const neighbors = graph[current] || [];
+
+      neighbors.forEach((neighbor, idx) => {
+        if (!visited.has(neighbor)) {
+          const angle = (idx / neighbors.length) * 2 * Math.PI;
+          const distance = 100 + Math.random() * 50;
+          positions[neighbor] = {
+            x: positions[current].x + Math.cos(angle) * distance,
+            y: positions[current].y + Math.sin(angle) * distance,
+          };
+          visited.add(neighbor);
+          queue.push(neighbor);
+        }
+      });
     }
+
+    const xCoords = Object.values(positions).map(p => p.x);
+    const yCoords = Object.values(positions).map(p => p.y);
+    const minX = Math.min(...xCoords);
+    const maxX = Math.max(...xCoords);
+    const minY = Math.min(...yCoords);
+    const maxY = Math.max(...yCoords);
+
+    const rangeX = maxX - minX || 1;
+    const rangeY = maxY - minY || 1;
+
+    nodes.forEach(node => {
+      if (positions[node]) {
+        nodePositions[node] = {
+          x: MAP_PADDING + ((positions[node].x - minX) / rangeX) * (width - MAP_PADDING * 2),
+          y: MAP_PADDING + ((positions[node].y - minY) / rangeY) * (height - MAP_PADDING * 2),
+        };
+      }
+    });
   }
 
   return nodePositions;
@@ -53,7 +128,7 @@ function TrafficMap({ trafficData, nodes, edges }) {
 
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    const nodePositions = buildNodePositions(canvas.width, canvas.height);
+    const nodePositions = buildNodePositions(canvas.width, canvas.height, edges, nodes);
     const blockedSet = createBlockedEdgeSet(trafficData.blocked_edges);
 
     edges.forEach((edge) => {
