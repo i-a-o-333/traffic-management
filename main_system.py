@@ -241,10 +241,10 @@ class TrafficSim:
         self.cfg = DemandConfig()
         self.nodes = nodes
         self.phase = np.random.rand(len(nodes)) * 10
-        self.hist = {n: deque([200.0] * 120, maxlen=120) for n in self.nodes}
-        self.hist_sim = {n: deque([200.0] * 120, maxlen=120) for n in self.nodes}
-        self.hist_real = {n: deque([200.0] * 120, maxlen=120) for n in self.nodes}
-        self.ema = {n: 200.0 for n in self.nodes}
+        self.hist = self._build_history_buffers()
+        self.hist_sim = self._build_history_buffers()
+        self.hist_real = self._build_history_buffers()
+        self.ema = {n: DEFAULT_VOLUME for n in self.nodes}
         self.health = {n: SensorHealth() for n in self.nodes}
         self.last_context = "Clear"
 
