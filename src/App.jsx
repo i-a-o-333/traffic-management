@@ -21,23 +21,21 @@ function App() {
   const [selectedDest, setSelectedDest] = useState('');
   const [aiEnabled, setAiEnabled] = useState(true);
   const [isConnected, setIsConnected] = useState(false);
+  const [cityConfig, setCityConfig] = useState(null);
   const wsRef = useRef(null);
   const reconnectTimeoutRef = useRef(null);
 
   useEffect(() => {
     async function loadInitialData() {
-      const [nodesData, edgesData] = await Promise.all([
+      const [nodesData, edgesData, configData] = await Promise.all([
         fetchJson('/api/nodes'),
         fetchJson('/api/edges'),
+        fetchJson('/api/config'),
       ]);
 
       setNodes(nodesData.nodes);
       setEdges(edgesData.edges);
-      setPositions(nodesData.positions || {});
-      setCityInfo({
-        name: nodesData.city,
-        source: nodesData.city_source,
-      });
+      setCityConfig(configData);
 
       if (nodesData.nodes.length > 0) {
         setSelectedOrigin(nodesData.nodes[0]);
@@ -114,8 +112,15 @@ function App() {
     <div className="app">
       <header className="header">
         <div className="header-content">
-          <h1 className="title">Traffic Control System</h1>
-          {cityInfo && <span>{cityInfo.name} · {cityInfo.source}</span>}
+          <div>
+            <h1 className="title">Traffic Control System</h1>
+            {cityConfig && (
+              <p style={{ color: 'rgba(255,255,255,0.8)', fontSize: '0.9rem', marginTop: '0.25rem' }}>
+                {cityConfig.use_real_city ? `${cityConfig.city_name} Network` : 'Simulated City Grid'}
+                {' '} • {cityConfig.node_count} nodes • {cityConfig.edge_count} roads
+              </p>
+            )}
+          </div>
           <div className="connection-status">
             <div className={`status-indicator ${isConnected ? 'connected' : 'disconnected'}`}></div>
             <span>{isConnected ? 'Live' : 'Disconnected'}</span>
@@ -144,7 +149,6 @@ function App() {
               trafficData={trafficData}
               nodes={nodes}
               edges={edges}
-              positions={positions}
             />
           </div>
 

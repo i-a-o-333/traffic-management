@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from main_system import TrafficSim, Router, NeuralPredictor, AIDecisionEngine, LiveTrafficIntegrator
+import os
 
 app = FastAPI()
 
@@ -17,7 +18,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-router = Router()
+USE_REAL_CITY = os.getenv("USE_REAL_CITY", "false").lower() == "true"
+CITY_NAME = os.getenv("CITY_NAME", "San Francisco")
+
+router = Router(use_real_city=USE_REAL_CITY, city_name=CITY_NAME)
 nodes = router.nodes
 sim = TrafficSim(nodes)
 nn = NeuralPredictor()
@@ -59,16 +63,6 @@ def build_route_payload(path_edges, route_cost):
         "edges": [[u, v] for u, v in path_edges] if path_edges else [],
         "cost": route_cost,
         "eta_minutes": (route_cost / 60.0) if route_cost else 0,
-    }
-
-
-def serialize_node_positions():
-    return {
-        node: {
-            "x": router.G.nodes[node].get("x"),
-            "y": router.G.nodes[node].get("y"),
-        }
-        for node in nodes
     }
 
 
@@ -185,6 +179,16 @@ async def get_live_status():
     }
 
 
+@app.get("/api/config")
+async def get_config():
+    return {
+        "use_real_city": USE_REAL_CITY,
+        "city_name": CITY_NAME,
+        "node_count": len(nodes),
+        "edge_count": router.G.number_of_edges(),
+    }
+
+
 @app.websocket("/ws/traffic")
 async def websocket_endpoint(websocket: WebSocket):
     global vols
@@ -219,11 +223,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 "health": {
                     node: {"quality": sim.health[node].quality, "degraded": sim.health[node].degraded}
                     for node in nodes[:10]
-                },
-                "city": {
-                    "name": router.city,
-                    "source": router.city_source,
-                    "center": router.city_center,
                 },
             })
             await asyncio.sleep(1)

@@ -7,7 +7,6 @@ from datetime import datetime
 
 import networkx as nx
 import numpy as np
-import requests
 import torch
 import torch.nn as nn
 
@@ -17,13 +16,6 @@ ROAD_SPECS = {
     "local": {"speed": 30, "lanes": 1, "class_weight": 1.3},
     "ring": {"speed": 48, "lanes": 2, "class_weight": 0.95},
 }
-HISTORY_LENGTH = 120
-DEFAULT_VOLUME = 200.0
-MAX_VOLUME = 890
-SENSOR_DROPOUT_PROBABILITY = 0.015
-DEFAULT_CITY = os.getenv("TRAFFIC_CITY", "San Francisco, California")
-DEFAULT_CITY_RADIUS_METERS = int(os.getenv("TRAFFIC_CITY_RADIUS_METERS", "2500"))
-MAX_CITY_NODES = int(os.getenv("TRAFFIC_MAX_CITY_NODES", "80"))
 
 
 @dataclass
@@ -97,7 +89,13 @@ class NeuralPredictor:
 
 
 class LiveTrafficIntegrator:
-    """Live data from free Open-Meteo and OSRM services with resilient fallbacks."""
+    """Live data from TomTom/X/HERE/Google with resilient fallbacks."""
+
+    def __init__(self):
+        self.tomtom_key = os.getenv("TOMTOM_API_KEY")
+        self.here_key = os.getenv("HERE_API_KEY")
+        self.google_key = os.getenv("GOOGLE_MAPS_API_KEY")
+        self.x_bearer = os.getenv("X_BEARER_TOKEN")
 
     def __init__(self):
         self.last_poll = 0.0
@@ -125,68 +123,113 @@ class LiveTrafficIntegrator:
         success = False
 
         try:
-            self.provider_status["OpenStreetMap"] = "ok"
-            self.speed_factor = self.fetch_open_meteo_speed_factor(origin_xy)
-            self.provider_status["Open-Meteo"] = "ok"
+            self.speed_factor = self.fetch_tomtom_speed_factor()
+            self.provider_status["TomTom"] = "ok"
             success = True
         except Exception as exc:
-            self.provider_status["Open-Meteo"] = "degraded"
-            self.last_error = f"Open-Meteo: {exc}"
+            self.provider_status["TomTom"] = "degraded"
+            self.last_error = f"TomTom: {exc}"
             self.speed_factor = 1.0
 
         try:
-            self.external_eta_s = self.fetch_osrm_eta(origin_xy, dest_xy)
-            self.provider_status["OSRM"] = "ok"
+            self.incident_points = self.fetch_here_incidents(origin_xy)
+            self.provider_status["HERE"] = "ok"
             success = True
         except Exception as exc:
-            self.provider_status["OSRM"] = "degraded"
-            self.last_error = f"{self.last_error} | OSRM: {exc}".strip(" |")
-            self.external_eta_s = None
+            self.provider_status["HERE"] = "degraded"
+            self.last_error = f"{self.last_error} | HERE: {exc}".strip(" |")
+            self.incident_points = []
+
+        try:
+            self.social_incidents = self.fetch_x_incidents()
+            self.provider_status["X"] = "ok" if self.social_incidents is not None else "degraded"
+            success = True
+        except Exception as exc:
+            self.provider_status["X"] = "degraded"
+            self.last_error = f"{self.last_error} | X: {exc}".strip(" |")
             self.social_incidents = []
+
+        try:
+            self.google_eta_s = self.fetch_google_eta(origin_xy, dest_xy)
+            self.provider_status["Google"] = "ok"
+            success = True
+        except Exception as exc:
+            self.provider_status["Google"] = "degraded"
+            self.last_error = f"{self.last_error} | Google: {exc}".strip(" |")
+            self.google_eta_s = None
 
         self.live_mode = success
         if success:
             self.last_success = time.time()
         self.last_latency_ms = int((time.time() - started) * 1000)
 
-    def fetch_open_meteo_speed_factor(self, origin_xy: tuple[float, float] | None) -> float:
-        if not origin_xy:
-            return 1.0
-        lon, lat = origin_xy
-        resp = requests.get(
-            "https://api.open-meteo.com/v1/forecast",
-            params={
-                "latitude": lat,
-                "longitude": lon,
-                "current": "precipitation,wind_speed_10m",
-            },
-            timeout=8,
-        )
+    def fetch_tomtom_speed_factor(self) -> float:
+        if not self.tomtom_key:
+            raise RuntimeError("TOMTOM_API_KEY missing")
+        lat, lon = 12.9716, 77.5946
+        url = f"https://api.tomtom.com/traffic/services/4/flowSegmentData/absolute/10/json?point={lat},{lon}&key={self.tomtom_key}"
+        resp = requests.get(url, timeout=8)
         resp.raise_for_status()
-        current = resp.json().get("current", {})
-        precipitation = float(current.get("precipitation", 0.0) or 0.0)
-        wind_speed = float(current.get("wind_speed_10m", 0.0) or 0.0)
-        weather_penalty = min(0.45, precipitation * 0.06 + wind_speed * 0.01)
-        return float(np.clip(1.0 - weather_penalty, 0.55, 1.0))
+        data = resp.json().get("flowSegmentData", {})
+        current = float(data.get("currentSpeed", 0) or 0)
+        freeflow = max(1.0, float(data.get("freeFlowSpeed", 1) or 1))
+        if current <= 0:
+            raise RuntimeError("TomTom missing currentSpeed")
+        jam_factor = np.clip(1.0 - (current / freeflow), 0.0, 1.0)
+        return float(np.clip(1.0 - jam_factor * 0.65, 0.2, 1.0))
 
-    def fetch_osrm_eta(self, origin_xy: tuple[float, float] | None, dest_xy: tuple[float, float] | None):
-        if not origin_xy or not dest_xy:
+    def fetch_here_incidents(self, origin_xy: tuple[float, float] | None):
+        if not self.here_key or not origin_xy:
+            return []
+        lon, lat = origin_xy
+        bbox = f"{lat-0.08},{lon-0.08},{lat+0.08},{lon+0.08}"
+        url = f"https://data.traffic.hereapi.com/v7/incidents?in=bbox:{bbox}&apiKey={self.here_key}"
+        resp = requests.get(url, timeout=8)
+        resp.raise_for_status()
+        data = resp.json()
+        points = []
+        for item in data.get("results", [])[:20]:
+            loc = item.get("location", {})
+            lat_ = loc.get("lat")
+            lon_ = loc.get("lng")
+            if lat_ is not None and lon_ is not None:
+                points.append((lat_, lon_))
+        return points
+
+    def fetch_x_incidents(self):
+        if not self.x_bearer:
+            return []
+        query = '("traffic jam Bengaluru" OR "accident Bengaluru highway") filter:news since:2025-02-01'
+        url = "https://api.x.com/2/tweets/search/recent"
+        headers = {"Authorization": f"Bearer {self.x_bearer}"}
+        params = {"query": query, "max_results": 10}
+        resp = requests.get(url, headers=headers, params=params, timeout=8)
+        resp.raise_for_status()
+        data = resp.json()
+        return [item.get("text", "") for item in data.get("data", [])]
+
+    def fetch_google_eta(self, origin_xy: tuple[float, float] | None, dest_xy: tuple[float, float] | None):
+        if not self.google_key or not origin_xy or not dest_xy:
             return None
         origin = f"{origin_xy[1]},{origin_xy[0]}"
         dest = f"{dest_xy[1]},{dest_xy[0]}"
-        url = f"https://router.project-osrm.org/route/v1/driving/{origin};{dest}"
-        resp = requests.get(url, params={"overview": "false"}, timeout=8)
+        url = "https://maps.googleapis.com/maps/api/directions/json"
+        params = {"origin": origin, "destination": dest, "departure_time": "now", "key": self.google_key}
+        resp = requests.get(url, params=params, timeout=8)
         resp.raise_for_status()
         data = resp.json()
         routes = data.get("routes", [])
         if not routes:
             return None
-        return routes[0].get("duration")
+        legs = routes[0].get("legs", [])
+        if not legs:
+            return None
+        return legs[0].get("duration_in_traffic", {}).get("value") or legs[0].get("duration", {}).get("value")
 
     def live_badge(self):
         if self.live_mode:
             age = int(time.time() - self.last_success)
-            return f"Live: Open-Meteo/OSRM • Updated {age}s ago"
+            return f"Live: TomTom • Updated {age}s ago"
         return "Live: Simulation only"
 
     def provider_badge(self):
@@ -206,25 +249,11 @@ class TrafficSim:
         self.health = {n: SensorHealth() for n in self.nodes}
         self.last_context = "Clear"
 
-    def _build_history_buffers(self):
-        return {node: deque([DEFAULT_VOLUME] * HISTORY_LENGTH, maxlen=HISTORY_LENGTH) for node in self.nodes}
-
     def calibrate_from_historical(self, traffic_integrator: LiveTrafficIntegrator):
-        if traffic_integrator.live_mode:
+        if traffic_integrator.tomtom_key:
             self.cfg.morning_peak = (7, 11)
             self.cfg.evening_peak = (16, 21)
             self.cfg.weekend_drop = 0.78
-
-    def _update_sensor_health(self, node: str, effective_volume: float):
-        health = self.health[node]
-        if random.random() < SENSOR_DROPOUT_PROBABILITY:
-            effective_volume = self.ema[node]
-            health.dropouts += 1
-            health.quality = max(0.2, health.quality - 0.08)
-        else:
-            health.quality = min(1.0, health.quality + 0.01)
-        health.degraded = health.quality < 0.55
-        return effective_volume
 
     def _hour_multiplier(self, now: datetime) -> float:
         hour = now.hour + now.minute / 60.0
@@ -262,9 +291,17 @@ class TrafficSim:
             base = 220 + 40 * np.sin(t / 60)
             wave = 120 * np.sin(t / 10 + self.phase[index])
             noise = np.random.normal(0, 15)
-            simulated_volume = np.clip((base + wave + noise) * demand_multiplier * weather_factor * event_factor, 30, MAX_VOLUME)
+            simulated_volume = np.clip((base + wave + noise) * demand_multiplier * weather_factor * event_factor, 30, 890)
             effective_volume = simulated_volume * speed_factor
-            effective_volume = self._update_sensor_health(node, effective_volume)
+
+            health = self.health[node]
+            if random.random() < 0.015:
+                effective_volume = self.ema[node]
+                health.dropouts += 1
+                health.quality = max(0.2, health.quality - 0.08)
+            else:
+                health.quality = min(1.0, health.quality + 0.01)
+            health.degraded = health.quality < 0.55
 
             self.ema[node] = 0.2 * effective_volume + 0.8 * self.ema[node]
             smoothed_volume = float(self.ema[node])
@@ -277,16 +314,21 @@ class TrafficSim:
 
 
 class Router:
-    def __init__(self, city=DEFAULT_CITY, grid_w=8, grid_h=6, spacing_km=0.7):
+    def __init__(self, city="SimCity Grid", grid_w=8, grid_h=6, spacing_km=0.7, use_real_city=False, city_name="San Francisco"):
         self.city = city
         self.grid_w = grid_w
         self.grid_h = grid_h
         self.spacing_km = spacing_km
+        self.use_real_city = use_real_city
+        self.city_name = city_name
         self.G = nx.Graph()
         self.blocked_edges = {}
-        self.city_source = "simulated"
-        self.city_center = None
-        self._build_city()
+
+        if use_real_city:
+            self._build_real_city_network()
+        else:
+            self._build_simulated_city()
+
         self.nodes = list(self.G.nodes())
 
     def _node_name(self, x, y):
@@ -465,24 +507,121 @@ class Router:
             self._add_road(self._node_name(0, y), self._node_name(0, y + 1), self.spacing_km * 1.15, "ring")
             self._add_road(self._node_name(self.grid_w - 1, y), self._node_name(self.grid_w - 1, y + 1), self.spacing_km * 1.15, "ring")
 
+    def _build_real_city_network(self):
+        """Build a network based on real city layout or simulated realistic city"""
+        city_configs = {
+            "San Francisco": {
+                "center": (-122.4194, 37.7749),
+                "landmarks": [
+                    ("Downtown", -122.4194, 37.7749),
+                    ("Mission", -122.4194, 37.7599),
+                    ("SOMA", -122.3928, 37.7749),
+                    ("Marina", -122.4378, 37.8024),
+                    ("Castro", -122.4350, 37.7609),
+                    ("Haight", -122.4469, 37.7694),
+                    ("Richmond", -122.4688, 37.7800),
+                    ("Sunset", -122.4625, 37.7550),
+                    ("Financial", -122.3988, 37.7941),
+                    ("Embarcadero", -122.3933, 37.7955),
+                    ("North Beach", -122.4100, 37.8005),
+                    ("Chinatown", -122.4058, 37.7941),
+                    ("Potrero", -122.4025, 37.7599),
+                    ("Nob Hill", -122.4161, 37.7928),
+                    ("Pac Heights", -122.4375, 37.7925),
+                ],
+            },
+            "New York": {
+                "center": (-74.0060, 40.7128),
+                "landmarks": [
+                    ("Midtown", -73.9857, 40.7549),
+                    ("Times Square", -73.9855, 40.7580),
+                    ("Wall Street", -74.0088, 40.7074),
+                    ("Central Park", -73.9654, 40.7829),
+                    ("SoHo", -74.0014, 40.7233),
+                    ("Chelsea", -74.0014, 40.7465),
+                    ("Greenwich", -74.0027, 40.7336),
+                    ("Tribeca", -74.0099, 40.7195),
+                    ("East Village", -73.9865, 40.7265),
+                    ("Upper East", -73.9626, 40.7736),
+                    ("Upper West", -73.9755, 40.7870),
+                    ("Harlem", -73.9496, 40.8116),
+                    ("Brooklyn Heights", -73.9926, 40.6942),
+                    ("Williamsburg", -73.9532, 40.7081),
+                    ("Queens Plaza", -73.9375, 40.7489),
+                ],
+            },
+            "London": {
+                "center": (-0.1276, 51.5074),
+                "landmarks": [
+                    ("Westminster", -0.1276, 51.4994),
+                    ("City", -0.0877, 51.5155),
+                    ("Camden", -0.1426, 51.5390),
+                    ("Shoreditch", -0.0807, 51.5245),
+                    ("Kensington", -0.1932, 51.4990),
+                    ("Chelsea", -0.1687, 51.4875),
+                    ("Soho", -0.1318, 51.5136),
+                    ("Canary Wharf", -0.0235, 51.5054),
+                    ("Notting Hill", -0.2058, 51.5099),
+                    ("Hackney", -0.0553, 51.5450),
+                    ("Islington", -0.1028, 51.5465),
+                    ("Tower Bridge", -0.0754, 51.5055),
+                    ("Covent Garden", -0.1243, 51.5117),
+                    ("Mayfair", -0.1451, 51.5095),
+                    ("Southwark", -0.0955, 51.5010),
+                ],
+            },
+        }
+
+        config = city_configs.get(self.city_name, city_configs["San Francisco"])
+        landmarks = config["landmarks"]
+
+        for name, lon, lat in landmarks:
+            self.G.add_node(name, x=lon, y=lat, zone="URBAN")
+
+        for i, (name1, lon1, lat1) in enumerate(landmarks):
+            for name2, lon2, lat2 in landmarks[i + 1:]:
+                distance = self._haversine_distance(lat1, lon1, lat2, lon2)
+
+                if distance < 3.5:
+                    if distance < 1.2:
+                        road_type = "arterial"
+                    elif distance < 2.0:
+                        road_type = "collector"
+                    else:
+                        road_type = "local"
+
+                    self._add_road(name1, name2, distance, road_type)
+
+        for i, (name1, _, _) in enumerate(landmarks):
+            closest_nodes = []
+            for j, (name2, lon2, lat2) in enumerate(landmarks):
+                if i != j:
+                    lon1, lat1 = landmarks[i][1], landmarks[i][2]
+                    dist = self._haversine_distance(lat1, lon1, lat2, lon2)
+                    closest_nodes.append((dist, name2))
+
+            closest_nodes.sort()
+            for dist, name2 in closest_nodes[:4]:
+                if not self.G.has_edge(name1, name2) and dist < 5.0:
+                    road_type = "collector" if dist < 2.5 else "local"
+                    self._add_road(name1, name2, dist, road_type)
+
+    def _haversine_distance(self, lat1, lon1, lat2, lon2):
+        """Calculate distance between two points in km"""
+        R = 6371
+        lat1_rad, lon1_rad = np.radians(lat1), np.radians(lon1)
+        lat2_rad, lon2_rad = np.radians(lat2), np.radians(lon2)
+
+        dlat = lat2_rad - lat1_rad
+        dlon = lon2_rad - lon1_rad
+
+        a = np.sin(dlat / 2)**2 + np.cos(lat1_rad) * np.cos(lat2_rad) * np.sin(dlon / 2)**2
+        c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+
+        return R * c
+
     def block_edge(self, u, v, duration=30):
         self.blocked_edges[self.normalize_edge(u, v)] = time.time() + duration
-
-    def block_incident_near(self, lat: float, lon: float, duration=45):
-        nearest = None
-        nearest_distance = 1e9
-        for u, v in self.G.edges():
-            ux, uy = self.G.nodes[u]["x"], self.G.nodes[u]["y"]
-            vx, vy = self.G.nodes[v]["x"], self.G.nodes[v]["y"]
-            cx, cy = (ux + vx) / 2.0, (uy + vy) / 2.0
-            distance = (cx - lon) ** 2 + (cy - lat) ** 2
-            if distance < nearest_distance:
-                nearest_distance = distance
-                nearest = (u, v)
-        if nearest:
-            self.block_edge(nearest[0], nearest[1], duration)
-            return nearest
-        return None
 
     def check_blocks(self):
         now = time.time()
